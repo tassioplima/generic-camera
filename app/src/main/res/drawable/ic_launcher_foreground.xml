@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Viewfinder bump -->
+    <path
+        android:fillColor="#3E2723"
+        android:pathData="M26,32 L42,32 L42,44 L26,44 Z" />
+
+    <!-- Camera body -->
+    <path
+        android:fillColor="#3E2723"
+        android:pathData="M26,44
+            L82,44
+            A8,8 0 0,1 90,52
+            L90,80
+            A8,8 0 0,1 82,88
+            L26,88
+            A8,8 0 0,1 18,80
+            L18,52
+            A8,8 0 0,1 26,44
+            Z" />
+
+    <!-- Rainbow accent stripe across the top edge of the body -->
+    <path android:fillColor="#E53935" android:pathData="M18,45 h12 v6 h-12 z" />
+    <path android:fillColor="#FB8C00" android:pathData="M30,45 h12 v6 h-12 z" />
+    <path android:fillColor="#FDD835" android:pathData="M42,45 h12 v6 h-12 z" />
+    <path android:fillColor="#43A047" android:pathData="M54,45 h12 v6 h-12 z" />
+    <path android:fillColor="#1E88E5" android:pathData="M66,45 h12 v6 h-12 z" />
+    <path android:fillColor="#8E24AA" android:pathData="M78,45 m0,0 h12 v6 h-12 z" />
+
+    <!-- Small shutter-button detail -->
+    <path
+        android:fillColor="#C9A96E"
+        android:pathData="M81,55 m-3,0 a3,3 0 1,0 6,0 a3,3 0 1,0 -6,0" />
+
+    <!-- Lens: outer ring, middle ring, glass, highlight -->
+    <path
+        android:fillColor="#212121"
+        android:pathData="M54,68 m-20,0 a20,20 0 1,0 40,0 a20,20 0 1,0 -40,0" />
+    <path
+        android:fillColor="#9E9E9E"
+        android:pathData="M54,68 m-15,0 a15,15 0 1,0 30,0 a15,15 0 1,0 -30,0" />
+    <path
+        android:fillColor="#141420"
+        android:pathData="M54,68 m-11,0 a11,11 0 1,0 22,0 a11,11 0 1,0 -22,0" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.75"
+        android:pathData="M48,63 m-3,0 a3,3 0 1,0 6,0 a3,3 0 1,0 -6,0" />
+</vector>
