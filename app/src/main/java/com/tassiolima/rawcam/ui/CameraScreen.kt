@@ -216,11 +216,15 @@ fun CameraScreen(viewModel: MainViewModel) {
         }
 
         state.errorMessage?.let {
-            Text(
-                text = it,
-                color = Color.Red,
+            Column(
                 modifier = Modifier.align(Alignment.Center).padding(24.dp),
-            )
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(text = it, color = Color.Red)
+                androidx.compose.material3.TextButton(onClick = { viewModel.retryOpenCamera() }) {
+                    Text("Tentar de novo", color = Color.White)
+                }
+            }
         }
     }
 

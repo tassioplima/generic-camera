@@ -58,6 +58,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { controller.resumeCamera() }
     }
 
+    fun retryOpenCamera() = controller.retryOpenCamera()
+
     fun setFlashMode(mode: FlashMode) = controller.setFlashMode(mode)
 
     fun setZoom(ratio: Float) = controller.setZoom(ratio)

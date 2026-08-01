@@ -3,6 +3,7 @@ package com.tassiolima.rawcam.camera
 import android.content.Context
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -18,10 +19,12 @@ import android.os.HandlerThread
 import android.util.Log
 import android.util.Size
 import android.view.Surface
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.File
 import kotlin.coroutines.resume
@@ -101,6 +104,89 @@ class CameraController(private val appContext: Context) {
         }
         backgroundThread = null
         backgroundHandler = null
+    }
+
+    private val controllerScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main.immediate,
+    )
+
+    /**
+     * Every call into a live CameraCaptureSession can throw if the HAL rejects it or the
+     * session already died underneath us - observed in practice when zooming across a
+     * physical-lens boundary (e.g. crossing into the ultra-wide or telephoto sensor) while a
+     * MediaRecorder surface is bound; some OEM HALs don't support that switch mid-recording
+     * and error the whole session out. Letting that exception propagate crashes the app on
+     * whatever thread called setZoom/focusTap/etc (usually the main thread from a gesture) -
+     * catch it here, log it, and try to recover the camera instead of taking the process down.
+     */
+    private fun safeSessionOp(label: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (e: CameraAccessException) {
+            Log.w(TAG, "Camera session op failed: $label", e)
+            scheduleRecovery()
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "Camera session op failed: $label", e)
+            scheduleRecovery()
+        } catch (e: IllegalArgumentException) {
+            Log.w(TAG, "Camera session op rejected: $label", e)
+        }
+    }
+
+    private var recoveryScheduled = false
+
+    private fun scheduleRecovery() {
+        if (recoveryScheduled) return
+        recoveryScheduled = true
+
+        val texture = retainedTexture
+        val cameraId = (if (_state.value.facingBack) backCameraId else frontCameraId)
+            ?: backCameraId ?: frontCameraId
+        val handler = backgroundHandler
+        if (texture == null || cameraId == null || handler == null) {
+            recoveryScheduled = false
+            return
+        }
+
+        _state.update { it.copy(errorMessage = null) }
+
+        stillSession?.close()
+        stillSession = null
+        cameraDevice?.close()
+        cameraDevice = null
+        activeRecorderSurface = null
+        activeRecordingFpsRange = null
+        isHighSpeedRecording = false
+        runCatching { recorder?.reset(); recorder?.release() }
+        recorder = null
+        recordingFile = null
+        _state.update { it.copy(isRecording = false, isHighSpeedRecording = false) }
+
+        handler.postDelayed({
+            controllerScope.launch {
+                recoveryScheduled = false
+                runCatching { openCameraInternal(cameraId, texture, previewWidth, previewHeight) }
+                    .onFailure {
+                        Log.e(TAG, "Camera recovery reopen failed", it)
+                        _state.update { s -> s.copy(errorMessage = "Não foi possível reconectar a câmera. Toque para tentar de novo.") }
+                    }
+            }
+        }, 350)
+    }
+
+    /** Lets the UI offer a manual "tap to retry" after a recovery attempt gives up. */
+    fun retryOpenCamera() {
+        val texture = retainedTexture ?: return
+        val cameraId = (if (_state.value.facingBack) backCameraId else frontCameraId)
+            ?: backCameraId ?: frontCameraId ?: return
+        _state.update { it.copy(errorMessage = null) }
+        controllerScope.launch {
+            runCatching { openCameraInternal(cameraId, texture, previewWidth, previewHeight) }
+                .onFailure {
+                    Log.e(TAG, "Manual camera retry failed", it)
+                    _state.update { s -> s.copy(errorMessage = "Não foi possível reconectar a câmera. Toque para tentar de novo.") }
+                }
+        }
     }
 
     /** Called once the TextureView's SurfaceTexture is ready. Opens the back camera by default. */
@@ -352,7 +438,9 @@ class CameraController(private val appContext: Context) {
         if (isHighSpeedRecording) return
         val device = cameraDevice ?: return
         val builder = buildLiveRequestBuilder(device) ?: return
-        session.setRepeatingRequest(builder.build(), afStateCallback, backgroundHandler)
+        safeSessionOp("setRepeatingRequest") {
+            session.setRepeatingRequest(builder.build(), afStateCallback, backgroundHandler)
+        }
     }
 
     /**
@@ -500,7 +588,7 @@ class CameraController(private val appContext: Context) {
         builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(lockedRegion))
         builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(lockedRegion))
         builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
-        session.capture(builder.build(), afStateCallback, backgroundHandler)
+        safeSessionOp("focusTap capture") { session.capture(builder.build(), afStateCallback, backgroundHandler) }
 
         val runnable = Runnable {
             lockedRegion = null
@@ -536,10 +624,12 @@ class CameraController(private val appContext: Context) {
 
         val builder = buildLiveRequestBuilder(device) ?: return
         builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
-        session.capture(builder.build(), afStateCallback, backgroundHandler)
+        safeSessionOp("focusLongPressLock capture") { session.capture(builder.build(), afStateCallback, backgroundHandler) }
 
         builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
-        session.setRepeatingRequest(builder.build(), afStateCallback, backgroundHandler)
+        safeSessionOp("focusLongPressLock setRepeatingRequest") {
+            session.setRepeatingRequest(builder.build(), afStateCallback, backgroundHandler)
+        }
     }
 
     /** While locked, a vertical drag adjusts exposure compensation (brightness). */
@@ -771,6 +861,7 @@ class CameraController(private val appContext: Context) {
     fun release() {
         closeCameraInternal(keepPreview = false)
         retainedTexture = null
+        controllerScope.cancel()
     }
 
     // ----- Helpers -----
