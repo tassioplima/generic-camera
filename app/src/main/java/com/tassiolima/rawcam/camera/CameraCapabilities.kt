@@ -58,6 +58,9 @@ data class CameraProfile(
     val exposureCompensationRange: android.util.Range<Int>,
     val exposureCompensationStep: Float,
     val zoomPresets: List<ZoomPreset>,
+    val hasFlash: Boolean,
+    val flashStrengthMaxLevel: Int,
+    val flashStrengthDefaultLevel: Int,
 )
 
 object CameraCapabilities {
@@ -106,6 +109,10 @@ object CameraCapabilities {
 
         val zoomPresets = computeZoomPresets(manager, chars, zoomRange)
 
+        val hasFlash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) ?: false
+        val flashStrengthMax = chars.get(CameraCharacteristics.FLASH_INFO_STRENGTH_MAXIMUM_LEVEL) ?: 1
+        val flashStrengthDefault = chars.get(CameraCharacteristics.FLASH_INFO_STRENGTH_DEFAULT_LEVEL) ?: 1
+
         return CameraProfile(
             cameraId = cameraId,
             lensFacing = chars.get(CameraCharacteristics.LENS_FACING) ?: CameraCharacteristics.LENS_FACING_BACK,
@@ -120,6 +127,9 @@ object CameraCapabilities {
             exposureCompensationRange = evRange,
             exposureCompensationStep = evStep,
             zoomPresets = zoomPresets,
+            hasFlash = hasFlash,
+            flashStrengthMaxLevel = flashStrengthMax,
+            flashStrengthDefaultLevel = flashStrengthDefault,
         )
     }
 

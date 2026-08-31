@@ -468,13 +468,34 @@ class CameraController(private val appContext: Context) {
 
     private fun applyLiveParams(builder: CaptureRequest.Builder) {
         val s = _state.value
-        builder.set(CaptureRequest.CONTROL_AE_MODE, s.flashMode.toAeMode())
         builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF)
         builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
         builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, s.zoomRatio)
         builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, s.exposureCompensation)
-        if (s.flashMode == FlashMode.TORCH) {
-            builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
+
+        // The live/repeating stream must never carry a flash-firing AE mode
+        // (ON_ALWAYS_FLASH/ON_AUTO_FLASH) - several HALs interpret that literally per frame and
+        // strobe the physical LED on every preview frame, which is the "pisca muito rápido" bug.
+        // The bright flash belongs only on the still-capture request (PhotoCapture.
+        // buildCaptureRequest). Here we just light a steady, dimmed focus-assist torch when the
+        // user has flash ON, so framing/focusing in the dark is easier without strobing or
+        // wasting the flash's peak brightness before the actual shot.
+        builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+        when (s.flashMode) {
+            FlashMode.TORCH -> {
+                builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
+            }
+            FlashMode.ON -> {
+                builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
+                val prof = profile
+                if (prof != null && prof.flashStrengthMaxLevel > 1) {
+                    val half = ((prof.flashStrengthMaxLevel + 1) / 2).coerceIn(1, prof.flashStrengthMaxLevel)
+                    builder.set(CaptureRequest.FLASH_STRENGTH_LEVEL, half)
+                }
+            }
+            FlashMode.AUTO, FlashMode.OFF -> {
+                builder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
+            }
         }
 
         val continuousAfMode = if (activeRecorderSurface != null) {
@@ -573,6 +594,7 @@ class CameraController(private val appContext: Context) {
             xInView, yInView, previewWidth, previewHeight,
             prof.activeArraySize, prof.sensorOrientation,
             prof.lensFacing == CameraCharacteristics.LENS_FACING_FRONT,
+            _state.value.zoomRatio,
         )
         _state.update {
             it.copy(
@@ -613,6 +635,7 @@ class CameraController(private val appContext: Context) {
             xInView, yInView, previewWidth, previewHeight,
             prof.activeArraySize, prof.sensorOrientation,
             prof.lensFacing == CameraCharacteristics.LENS_FACING_FRONT,
+            _state.value.zoomRatio,
         )
         _state.update {
             it.copy(
@@ -654,12 +677,61 @@ class CameraController(private val appContext: Context) {
 
     // ----- Photo capture -----
 
-    suspend fun capturePhoto(): CapturedMedia = suspendCancellableCoroutine { cont ->
-        val session = stillSession
-        val device = cameraDevice
+    suspend fun capturePhoto(): CapturedMedia {
+        val session = stillSession ?: error("Camera not ready")
+        val device = cameraDevice ?: error("Camera not ready")
+        val prof = profile ?: error("Camera not ready")
+
+        // A real camera flash needs a brief metering pre-flash to figure out the right power
+        // for the actual shot - skipping straight to a full-power strobe (what this app used to
+        // do) is exactly what blows highlights out on anything reasonably close. This mirrors
+        // what every stock camera app does before a flash-lit still capture.
+        if (_state.value.flashMode != FlashMode.OFF && prof.hasFlash) {
+            runAePrecapture(session, device)
+        }
+
+        return performStillCapture(session, device, prof)
+    }
+
+    /**
+     * Triggers CONTROL_AE_PRECAPTURE_TRIGGER_START and waits (with a timeout, since not every
+     * HAL reports convergence the same way) for CONTROL_AE_STATE to settle before the real
+     * flash-lit capture proceeds.
+     */
+    private suspend fun runAePrecapture(session: CameraCaptureSession, device: CameraDevice) {
+        val builder = buildLiveRequestBuilder(device) ?: return
+        val deferred = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val callback = object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                result: TotalCaptureResult,
+            ) {
+                val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
+                val settled = aeState == null ||
+                    aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+                    aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
+                    aeState == CaptureResult.CONTROL_AE_STATE_LOCKED
+                if (settled && deferred.isActive) deferred.complete(Unit)
+            }
+        }
+
+        builder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START)
+        safeSessionOp("ae precapture trigger") { session.capture(builder.build(), callback, backgroundHandler) }
+
+        builder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_IDLE)
+        safeSessionOp("ae precapture repeating") { session.setRepeatingRequest(builder.build(), callback, backgroundHandler) }
+
+        kotlinx.coroutines.withTimeoutOrNull(1200) { deferred.await() }
+    }
+
+    private suspend fun performStillCapture(
+        session: CameraCaptureSession,
+        device: CameraDevice,
+        prof: CameraProfile,
+    ): CapturedMedia = suspendCancellableCoroutine { cont ->
         val jpeg = jpegReader
-        val prof = profile
-        if (session == null || device == null || jpeg == null || prof == null) {
+        if (jpeg == null) {
             cont.resumeWithException(IllegalStateException("Camera not ready"))
             return@suspendCancellableCoroutine
         }
@@ -882,10 +954,14 @@ class CameraController(private val appContext: Context) {
     }
 
     private fun jpegOrientationDegrees(prof: CameraProfile): Int {
-        // Activity is locked to portrait, so the sensor-to-display rotation is just the
-        // sensor orientation itself (mirrored for the front camera).
-        val isFront = prof.lensFacing == CameraCharacteristics.LENS_FACING_FRONT
-        return if (isFront) (360 - prof.sensorOrientation) % 360 else prof.sensorOrientation
+        // The official Android formula is (sensorOrientation +/- deviceOrientation + 360) % 360,
+        // with the sign flipped for the front camera vs. back. Since the activity is locked to
+        // portrait (device orientation relative to natural = 0), that term drops out entirely
+        // and BOTH cameras reduce to the same thing: sensorOrientation itself. The previous
+        // "360 - sensorOrientation" front-camera special case was wrong - it applied a spurious
+        // 180 degree rotation on top of the fixed 0 term, which is exactly what made front
+        // camera photos come out upside-down/rotated ("invertida").
+        return prof.sensorOrientation % 360
     }
 
     private fun videoOrientationDegrees(prof: CameraProfile): Int = jpegOrientationDegrees(prof)
@@ -898,6 +974,7 @@ class CameraController(private val appContext: Context) {
         activeArray: Rect,
         sensorOrientation: Int,
         facingFront: Boolean,
+        zoomRatio: Float,
     ): MeteringRectangle {
         val nx = (x / viewWidth).coerceIn(0f, 1f)
         val ny = (y / viewHeight).coerceIn(0f, 1f)
@@ -910,9 +987,26 @@ class CameraController(private val appContext: Context) {
         }
         val mirroredX = if (facingFront) 1 - rx else rx
 
-        val sensorX = activeArray.left + (mirroredX * activeArray.width()).toInt()
-        val sensorY = activeArray.top + (ry * activeArray.height()).toInt()
-        val halfSize = (0.1f * minOf(activeArray.width(), activeArray.height())).toInt().coerceAtLeast(1)
+        // CONTROL_AF_REGIONS/CONTROL_AE_REGIONS are always expressed in full, un-zoomed active
+        // array coordinates - the framework does not remap them for you based on
+        // CONTROL_ZOOM_RATIO. So a tap on the current (possibly zoomed-in) preview only
+        // corresponds to a fraction of the full sensor once we first shrink that mapping down
+        // to whatever crop is actually visible right now. Skipping this (as the code used to)
+        // meant every tap effectively landed near the sensor's center once zoomed in - which is
+        // exactly the "can't focus on the object in the background" symptom when the object
+        // was framed by zooming in on it.
+        val z = zoomRatio.coerceAtLeast(0.01f)
+        val visibleWidth = activeArray.width() / z
+        val visibleHeight = activeArray.height() / z
+        val visibleLeft = activeArray.left + (activeArray.width() - visibleWidth) / 2f
+        val visibleTop = activeArray.top + (activeArray.height() - visibleHeight) / 2f
+
+        val sensorX = (visibleLeft + mirroredX * visibleWidth).toInt()
+        val sensorY = (visibleTop + ry * visibleHeight).toInt()
+        // Keep the metering box a consistent ~20% of the currently visible (zoomed) frame,
+        // rather than ~20% of the whole sensor - otherwise it balloons past the entire visible
+        // frame at high zoom and just meters "the middle of everything" instead of the tapped spot.
+        val halfSize = (0.1f * minOf(visibleWidth, visibleHeight)).toInt().coerceAtLeast(1)
 
         val rect = Rect(
             (sensorX - halfSize).coerceIn(activeArray.left, activeArray.right),
