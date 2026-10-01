@@ -30,6 +30,7 @@ fun SettingsSheet(
     onShutterSoundToggle: (Boolean) -> Unit,
     onShutterFlashToggle: (Boolean) -> Unit,
     onVideoSettingsChange: (VideoSizeOption, Int) -> Unit,
+    onNightVideoToggle: (Boolean) -> Unit,
     onClose: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(24.dp)) {
@@ -109,6 +110,22 @@ fun SettingsSheet(
                     }
                 }
             }
+        }
+
+        val highSpeed = currentOption?.isHighSpeed(state.selectedFps) == true
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Vídeo noturno")
+                Text(
+                    if (highSpeed) "Indisponível em ${state.selectedFps}fps (alta velocidade)"
+                    else "Mais luz por quadro e redução de ruído (vídeo e timelapse)",
+                    style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
+                )
+            }
+            Switch(checked = state.nightVideoEnabled, onCheckedChange = onNightVideoToggle, enabled = !highSpeed)
         }
 
         TextButton(onClick = onClose, modifier = Modifier.padding(top = 24.dp)) {

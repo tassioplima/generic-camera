@@ -24,6 +24,7 @@ import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.FlashlightOn
+import androidx.compose.material.icons.filled.NightsStay
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -89,6 +90,7 @@ fun CameraScreen(viewModel: MainViewModel) {
             previewBufferSize = state.previewBufferSize,
             sensorOrientation = state.sensorOrientation,
             onSurfaceAvailable = { texture, w, h -> viewModel.onPreviewSurfaceAvailable(texture, w, h) },
+            onSurfaceDestroyed = { viewModel.onPreviewSurfaceDestroyed() },
             onTap = { x, y ->
                 if (state.focusIndicator?.locked == true) viewModel.clearFocusLock() else viewModel.focusTap(x, y)
             },
@@ -132,12 +134,99 @@ fun CameraScreen(viewModel: MainViewModel) {
                 .padding(top = 40.dp, start = 16.dp, end = 16.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            IconButton(onClick = { viewModel.setFlashMode(nextFlashMode(state.flashMode)) }) {
-                Icon(flashIcon(state.flashMode), contentDescription = "Flash", tint = Color.White)
+            // Night photos use the vendor's multi-frame pipeline, which never fires the flash.
+            if (state.mode != CameraMode.NIGHT) {
+                IconButton(onClick = { viewModel.setFlashMode(nextFlashMode(state.flashMode)) }) {
+                    Icon(flashIcon(state.flashMode), contentDescription = "Flash", tint = Color.White)
+                }
+            } else {
+                Box(modifier = Modifier.size(48.dp))
             }
-            IconButton(onClick = { showSettings = true }) {
-                Icon(Icons.Filled.Settings, contentDescription = "Configurações", tint = Color.White)
+
+            if (state.mode.isVideo) {
+                val highSpeed = state.mode == CameraMode.VIDEO &&
+                    state.selectedVideoSize?.isHighSpeed(state.selectedFps) == true
+                val nightOn = state.nightVideoEnabled && !highSpeed
+                IconButton(
+                    onClick = { viewModel.setNightVideoEnabled(!state.nightVideoEnabled) },
+                    enabled = !highSpeed && !state.isRecording,
+                ) {
+                    Icon(
+                        Icons.Filled.NightsStay,
+                        contentDescription = if (nightOn) "Vídeo noturno ligado" else "Vídeo noturno desligado",
+                        tint = when {
+                            highSpeed -> Color.White.copy(alpha = 0.3f)
+                            nightOn -> Color(0xFFFFC107)
+                            else -> Color.White
+                        },
+                    )
+                }
             }
+
+            IconButton(onClick = { showSettings = true }, enabled = !state.isRecording) {
+                Icon(
+                    Icons.Filled.Settings,
+                    contentDescription = "Configurações",
+                    tint = if (state.isRecording) Color.White.copy(alpha = 0.3f) else Color.White,
+                )
+            }
+        }
+
+        if (state.mode == CameraMode.NIGHT || (state.mode.isVideo && state.nightVideoEnabled && !state.isHighSpeedRecording)) {
+            val hint = when {
+                state.mode == CameraMode.NIGHT && state.nightExtensionSupported -> "Modo noite • segure o celular firme"
+                state.mode == CameraMode.NIGHT -> "Modo noite (básico) • segure firme"
+                else -> "Vídeo noturno"
+            }
+            Text(
+                hint,
+                color = Color(0xFFFFC107),
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 100.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.45f))
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+            )
+        }
+
+        state.nightCaptureProgress?.let { progress ->
+            Column(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(16.dp))
+                    .background(Color.Black.copy(alpha = 0.6f))
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                if (progress >= 0) {
+                    androidx.compose.material3.CircularProgressIndicator(
+                        progress = { progress / 100f },
+                        color = Color(0xFFFFC107),
+                    )
+                } else {
+                    androidx.compose.material3.CircularProgressIndicator(color = Color(0xFFFFC107))
+                }
+                Text(
+                    "Mantenha o celular parado…",
+                    color = Color.White,
+                    modifier = Modifier.padding(top = 12.dp),
+                )
+            }
+        }
+
+        viewModel.infoMessage?.let { message ->
+            Text(
+                message,
+                color = Color.White,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 140.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.7f))
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            )
         }
 
         // Bottom controls
@@ -149,9 +238,27 @@ fun CameraScreen(viewModel: MainViewModel) {
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             if (state.isRecording) {
+                val label = if (state.mode == CameraMode.TIMELAPSE) {
+                    // Real time filmed -> how long it will play back for.
+                    "${formatElapsed(viewModel.elapsedMs)}  →  ${formatElapsed(viewModel.elapsedMs / state.timelapseSpeed)} no vídeo"
+                } else {
+                    formatElapsed(viewModel.elapsedMs)
+                }
                 Text(
-                    text = formatElapsed(viewModel.elapsedMs),
+                    text = label,
                     color = Color.Red,
+                    modifier = Modifier
+                        .padding(bottom = 12.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.45f))
+                        .padding(horizontal = 12.dp, vertical = 4.dp),
+                )
+            }
+
+            if (state.mode == CameraMode.TIMELAPSE && !state.isRecording) {
+                TimelapseSpeedRow(
+                    selected = state.timelapseSpeed,
+                    onSelect = { viewModel.setTimelapseSpeed(it) },
                     modifier = Modifier.padding(bottom = 12.dp),
                 )
             }
@@ -179,14 +286,15 @@ fun CameraScreen(viewModel: MainViewModel) {
 
             ModeToggle(
                 mode = state.mode,
-                enabled = !state.isRecording,
+                enabled = !state.isRecording && state.nightCaptureProgress == null,
                 onModeChange = { viewModel.setMode(it) },
             )
 
             Box(modifier = Modifier.fillMaxWidth().padding(top = 20.dp)) {
                 IconButton(
                     onClick = { viewModel.switchCamera() },
-                    enabled = state.hasFrontCamera && !state.isRecording,
+                    enabled = state.hasFrontCamera && !state.isRecording && state.ready &&
+                        state.nightCaptureProgress == null,
                     modifier = Modifier.align(Alignment.CenterStart).padding(start = 32.dp),
                 ) {
                     Icon(Icons.Filled.Cameraswitch, contentDescription = "Trocar câmera", tint = Color.White)
@@ -195,12 +303,10 @@ fun CameraScreen(viewModel: MainViewModel) {
                 CaptureButton(
                     mode = state.mode,
                     isRecording = state.isRecording,
+                    busy = state.nightCaptureProgress != null,
                     modifier = Modifier.align(Alignment.Center),
                     onClick = {
-                        when (state.mode) {
-                            CameraMode.PHOTO -> viewModel.takePhoto()
-                            CameraMode.VIDEO -> viewModel.toggleRecording()
-                        }
+                        if (state.mode.isVideo) viewModel.toggleRecording() else viewModel.takePhoto()
                     },
                 )
 
@@ -209,6 +315,7 @@ fun CameraScreen(viewModel: MainViewModel) {
                         uri = state.lastCapture!!.uri,
                         isVideo = state.lastCapture!!.isVideo,
                         modifier = Modifier.align(Alignment.CenterEnd).padding(end = 24.dp),
+                        enabled = !state.isRecording,
                         onClick = { viewModel.openReview(state.lastCapture!!) },
                     )
                 }
@@ -245,6 +352,7 @@ fun CameraScreen(viewModel: MainViewModel) {
                 onShutterSoundToggle = { viewModel.setShutterSoundEnabled(it) },
                 onShutterFlashToggle = { viewModel.setShutterFlashEnabled(it) },
                 onVideoSettingsChange = { size, fps -> viewModel.setVideoSettings(size, fps) },
+                onNightVideoToggle = { viewModel.setNightVideoEnabled(it) },
                 onClose = {
                     scope.launch { sheetState.hide() }
                     showSettings = false
@@ -263,6 +371,7 @@ private fun CameraPreview(
     previewBufferSize: AndroidSize?,
     sensorOrientation: Int,
     onSurfaceAvailable: (SurfaceTexture, Int, Int) -> Unit,
+    onSurfaceDestroyed: () -> Unit,
     onTap: (Float, Float) -> Unit,
     onLongPress: (Float, Float) -> Unit,
     onExposureDrag: (Int) -> Unit,
@@ -360,7 +469,11 @@ private fun CameraPreview(
                         lastHeight = height
                     }
 
-                    override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
+                    override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+                        // Stop the camera streaming into this texture before it's released.
+                        onSurfaceDestroyed()
+                        return true
+                    }
 
                     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
                 }
@@ -488,6 +601,35 @@ private fun ZoomPresetRow(
 }
 
 @Composable
+private fun TimelapseSpeedRow(selected: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .clip(CircleShape)
+            .background(Color.Black.copy(alpha = 0.35f))
+            .padding(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        com.tassiolima.rawcam.camera.TIMELAPSE_SPEEDS.forEach { speed ->
+            val isSelected = speed == selected
+            Box(
+                modifier = Modifier
+                    .clip(CircleShape)
+                    .background(if (isSelected) Color(0xFFFFC107) else Color.Transparent)
+                    .clickable { onSelect(speed) }
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+            ) {
+                Text(
+                    "${speed}x",
+                    color = if (isSelected) Color.Black else Color.White,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun ModeToggle(mode: CameraMode, enabled: Boolean, onModeChange: (CameraMode) -> Unit) {
     Row(
         modifier = Modifier
@@ -495,16 +637,16 @@ private fun ModeToggle(mode: CameraMode, enabled: Boolean, onModeChange: (Camera
             .background(Color.White.copy(alpha = 0.15f))
             .padding(4.dp),
     ) {
-        listOf(CameraMode.PHOTO to "Foto", CameraMode.VIDEO to "Vídeo").forEach { (m, label) ->
+        CameraMode.entries.forEach { m ->
             val selected = mode == m
             Box(
                 modifier = Modifier
                     .clip(CircleShape)
                     .background(if (selected) Color.White else Color.Transparent)
                     .clickable(enabled = enabled) { onModeChange(m) }
-                    .padding(horizontal = 20.dp, vertical = 8.dp),
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
             ) {
-                Text(label, color = if (selected) Color.Black else Color.White)
+                Text(m.label, color = if (selected) Color.Black else Color.White)
             }
         }
     }
@@ -514,18 +656,23 @@ private fun ModeToggle(mode: CameraMode, enabled: Boolean, onModeChange: (Camera
 private fun CaptureButton(
     mode: CameraMode,
     isRecording: Boolean,
+    busy: Boolean,
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
     val ringColor = Color.White
-    val fillColor = if (mode == CameraMode.VIDEO && isRecording) Color.Red else Color.White
+    val fillColor = when {
+        mode.isVideo -> Color(0xFFE53935)
+        busy -> Color.White.copy(alpha = 0.4f)
+        else -> Color.White
+    }
 
     Box(
         modifier = modifier
             .size(80.dp)
             .clip(CircleShape)
             .background(Color.Transparent)
-            .clickable { onClick() },
+            .clickable(enabled = !busy) { onClick() },
         contentAlignment = Alignment.Center,
     ) {
         Box(
@@ -546,13 +693,24 @@ private fun CaptureButton(
                     .size(if (isRecording) 32.dp else 60.dp)
                     .clip(if (isRecording) androidx.compose.foundation.shape.RoundedCornerShape(6.dp) else CircleShape)
                     .background(fillColor),
-            )
+                contentAlignment = Alignment.Center,
+            ) {
+                if (mode == CameraMode.NIGHT) {
+                    Icon(Icons.Filled.NightsStay, contentDescription = null, tint = Color(0xFF1C1C1E))
+                }
+            }
         }
     }
 }
 
 @Composable
-private fun ThumbnailBubble(uri: android.net.Uri, isVideo: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+private fun ThumbnailBubble(
+    uri: android.net.Uri,
+    isVideo: Boolean,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
     val context = LocalContext.current
     var bitmap by remember(uri) { mutableStateOf<android.graphics.Bitmap?>(null) }
 
@@ -569,7 +727,7 @@ private fun ThumbnailBubble(uri: android.net.Uri, isVideo: Boolean, modifier: Mo
             .size(56.dp)
             .clip(CircleShape)
             .background(Color.DarkGray)
-            .clickable { onClick() },
+            .clickable(enabled = enabled) { onClick() },
         contentAlignment = Alignment.Center,
     ) {
         bitmap?.let {

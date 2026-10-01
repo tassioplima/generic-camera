@@ -61,6 +61,11 @@ data class CameraProfile(
     val hasFlash: Boolean,
     val flashStrengthMaxLevel: Int,
     val flashStrengthDefaultLevel: Int,
+    val supportsOis: Boolean,
+    /** Vendor multi-frame night processing exposed through Camera2 Extensions (EXTENSION_NIGHT). */
+    val nightExtensionSupported: Boolean,
+    /** Plain CONTROL_SCENE_MODE_NIGHT - the fallback when there's no night extension. */
+    val supportsNightSceneMode: Boolean,
 )
 
 object CameraCapabilities {
@@ -113,6 +118,13 @@ object CameraCapabilities {
         val flashStrengthMax = chars.get(CameraCharacteristics.FLASH_INFO_STRENGTH_MAXIMUM_LEVEL) ?: 1
         val flashStrengthDefault = chars.get(CameraCharacteristics.FLASH_INFO_STRENGTH_DEFAULT_LEVEL) ?: 1
 
+        val oisModes = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION) ?: intArrayOf()
+        val sceneModes = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES) ?: intArrayOf()
+        val nightExtension = runCatching {
+            manager.getCameraExtensionCharacteristics(cameraId).supportedExtensions
+                .contains(android.hardware.camera2.CameraExtensionCharacteristics.EXTENSION_NIGHT)
+        }.getOrDefault(false)
+
         return CameraProfile(
             cameraId = cameraId,
             lensFacing = chars.get(CameraCharacteristics.LENS_FACING) ?: CameraCharacteristics.LENS_FACING_BACK,
@@ -130,6 +142,9 @@ object CameraCapabilities {
             hasFlash = hasFlash,
             flashStrengthMaxLevel = flashStrengthMax,
             flashStrengthDefaultLevel = flashStrengthDefault,
+            supportsOis = oisModes.contains(CameraCharacteristics.LENS_OPTICAL_STABILIZATION_MODE_ON),
+            nightExtensionSupported = nightExtension,
+            supportsNightSceneMode = sceneModes.contains(CameraCharacteristics.CONTROL_SCENE_MODE_NIGHT),
         )
     }
 
@@ -229,6 +244,16 @@ object CameraCapabilities {
 
             VideoSizeOption(match, normalFps.toList(), highSpeedFps.toList())
         }
+    }
+
+    /**
+     * Night video: let AE drop the frame rate (e.g. [15,30] instead of [30,30]) so each frame
+     * can expose up to twice as long in the dark. The encoder still plays back at [desiredFps];
+     * in bright scenes AE stays at the top of the range, so nothing changes there.
+     */
+    fun nightFpsRange(profile: CameraProfile, desiredFps: Int): android.util.Range<Int> {
+        return profile.aeFpsRanges.filter { it.upper == desiredFps }.minByOrNull { it.lower }
+            ?: bestFpsRange(profile, desiredFps)
     }
 
     /** Picks the AE target fps range that best matches the requested fixed frame rate. */

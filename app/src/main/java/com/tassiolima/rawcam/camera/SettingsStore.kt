@@ -42,6 +42,14 @@ class SettingsStore(context: Context) {
         get() = prefs.getInt(KEY_VIDEO_FPS, 30)
         set(value) = prefs.edit().putInt(KEY_VIDEO_FPS, value).apply()
 
+    var nightVideoEnabled: Boolean
+        get() = prefs.getBoolean(KEY_NIGHT_VIDEO, false)
+        set(value) = prefs.edit().putBoolean(KEY_NIGHT_VIDEO, value).apply()
+
+    var timelapseSpeed: Int
+        get() = prefs.getInt(KEY_TIMELAPSE_SPEED, 10)
+        set(value) = prefs.edit().putInt(KEY_TIMELAPSE_SPEED, value).apply()
+
     fun saveVideoSettings(width: Int, height: Int, fps: Int) {
         prefs.edit()
             .putInt(KEY_VIDEO_W, width)
@@ -59,5 +67,7 @@ class SettingsStore(context: Context) {
         const val KEY_VIDEO_W = "video_width"
         const val KEY_VIDEO_H = "video_height"
         const val KEY_VIDEO_FPS = "video_fps"
+        const val KEY_NIGHT_VIDEO = "night_video_enabled"
+        const val KEY_TIMELAPSE_SPEED = "timelapse_speed"
     }
 }

@@ -3,7 +3,17 @@ package com.tassiolima.rawcam.camera
 import android.net.Uri
 import android.util.Size
 
-enum class CameraMode { PHOTO, VIDEO }
+enum class CameraMode(val label: String) {
+    NIGHT("Noite"),
+    PHOTO("Foto"),
+    VIDEO("Vídeo"),
+    TIMELAPSE("Timelapse");
+
+    val isVideo: Boolean get() = this == VIDEO || this == TIMELAPSE
+}
+
+/** Output-to-real-time speedup for timelapse: at 30x, 1 minute of filming plays back in 2s. */
+val TIMELAPSE_SPEEDS = listOf(5, 10, 30, 60, 120)
 
 enum class PhotoAspectRatio(val ratio: Float, val label: String) {
     RATIO_4_3(4f / 3f, "4:3"),
@@ -63,4 +73,11 @@ data class CameraUiState(
     val minExposureCompensation: Int = 0,
     val maxExposureCompensation: Int = 0,
     val exposureCompensationStep: Float = 1f,
+    // Night / timelapse
+    val nightExtensionSupported: Boolean = false,
+    // Non-null while a multi-frame night shot is being taken/processed (0-100, or -1 when the
+    // HAL doesn't report progress) - the user has to hold still the whole time.
+    val nightCaptureProgress: Int? = null,
+    val nightVideoEnabled: Boolean = false,
+    val timelapseSpeed: Int = 10,
 )

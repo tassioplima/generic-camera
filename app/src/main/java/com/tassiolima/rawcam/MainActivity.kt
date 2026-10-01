@@ -37,6 +37,17 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: MainViewModel by viewModels()
 
+    // The activity is portrait-locked, but the phone itself still gets turned sideways for
+    // landscape shots - track the physical rotation so photos/videos are saved upright.
+    private val orientationListener by lazy {
+        object : android.view.OrientationEventListener(this) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == ORIENTATION_UNKNOWN) return
+                viewModel.setDeviceOrientation(((orientation + 45) / 90 * 90) % 360)
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -76,11 +87,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (orientationListener.canDetectOrientation()) orientationListener.enable()
         viewModel.resumeCameraIfNeeded()
     }
 
     override fun onPause() {
         super.onPause()
+        orientationListener.disable()
         viewModel.pauseCamera()
     }
 }

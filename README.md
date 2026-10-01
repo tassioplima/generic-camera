@@ -15,6 +15,12 @@ capability differences on other phones are expected.
 - JPEG + optional RAW (.dng) capture, with noise reduction/edge enhancement disabled
 - Photo aspect ratio (4:3 / 16:9), composition grid
 - Video at 1080p/4K, including 120fps/240fps high-speed modes where the hardware supports them
+- Night photo mode using the vendor's multi-frame night pipeline (Camera2 Extensions
+  `EXTENSION_NIGHT`), with a scene-mode fallback on phones without it
+- Night video toggle (lower AE frame-rate floor + noise reduction) for video and timelapse
+- Timelapse at 5x/10x/30x/60x/120x (silent, 30fps playback)
+- Optical image stabilization on every stream where available; photos/videos saved upright
+  when the phone is held in landscape
 - Zoom presets computed from each physical lens's real focal length + sensor size, marking
   which ratios are true optical lens switches vs. digital crop
 - Tap-to-focus with live AF-state feedback, long-press to lock focus/exposure with a

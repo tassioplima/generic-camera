@@ -15,6 +15,7 @@ import com.tassiolima.rawcam.camera.CapturedMedia
 import com.tassiolima.rawcam.camera.FlashMode
 import com.tassiolima.rawcam.camera.PhotoAspectRatio
 import com.tassiolima.rawcam.camera.VideoSizeOption
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
@@ -30,7 +31,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var reviewMedia by mutableStateOf<CapturedMedia?>(null)
         private set
 
+    /** Short-lived status pill ("Vídeo muito curto…", "Falha ao salvar…"). */
+    var infoMessage by mutableStateOf<String?>(null)
+        private set
+    private var infoJob: Job? = null
+
+    private fun showInfo(message: String) {
+        infoMessage = message
+        infoJob?.cancel()
+        infoJob = viewModelScope.launch {
+            delay(2500)
+            infoMessage = null
+        }
+    }
+
     fun openReview(media: CapturedMedia) {
+        // The review screen replaces the camera screen (and its TextureView) - never while a
+        // clip is rolling, that would cut the recorder's frame source out from under it.
+        if (state.value.isRecording) return
         reviewMedia = media
     }
 
@@ -48,17 +66,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun onPreviewSurfaceDestroyed() = controller.onPreviewSurfaceDestroyed()
+
     fun switchCamera() {
         viewModelScope.launch { controller.switchCamera() }
     }
 
-    fun pauseCamera() = controller.pauseCamera()
+    /**
+     * Going to background: a recording can't continue (camera access is revoked for background
+     * apps and there's no foreground service), so stop and save it instead of leaving a frozen,
+     * half-dead recording behind.
+     */
+    fun pauseCamera() {
+        if (state.value.isRecording) {
+            viewModelScope.launch {
+                recordingTimerJob?.cancel()
+                runCatching { controller.stopVideoRecording(reopenPreview = false) }
+                    .onSuccess { media -> media?.let { controller.setLastCapture(it) } }
+            }
+        } else {
+            controller.pauseCamera()
+        }
+    }
 
     fun resumeCameraIfNeeded() {
         viewModelScope.launch { controller.resumeCamera() }
     }
 
     fun retryOpenCamera() = controller.retryOpenCamera()
+
+    fun setDeviceOrientation(degrees: Int) = controller.setDeviceOrientation(degrees)
 
     fun setFlashMode(mode: FlashMode) = controller.setFlashMode(mode)
 
@@ -68,7 +105,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setVideoSettings(size: VideoSizeOption, fps: Int) = controller.setVideoSettings(size, fps)
 
-    fun setMode(mode: CameraMode) = controller.setMode(mode)
+    fun setNightVideoEnabled(enabled: Boolean) = controller.setNightVideoEnabled(enabled)
+
+    fun setTimelapseSpeed(speed: Int) = controller.setTimelapseSpeed(speed)
+
+    fun setMode(mode: CameraMode) {
+        viewModelScope.launch { controller.setMode(mode) }
+    }
 
     fun setPhotoAspectRatio(ratio: PhotoAspectRatio) {
         viewModelScope.launch { controller.setPhotoAspectRatio(ratio) }
@@ -93,8 +136,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var shutterFlash by mutableStateOf(false)
         private set
 
+    // Main-thread only. A second tap while a capture is still in flight used to steal the
+    // first capture's ImageReader listener and lose a photo.
+    private var photoInFlight = false
+
     fun takePhoto() {
+        if (photoInFlight) return
         val s = state.value
+        if (!s.ready) return
+        photoInFlight = true
         if (s.shutterFlashEnabled) {
             shutterFlash = true
             viewModelScope.launch {
@@ -106,35 +156,61 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             shutterSound.play(android.media.MediaActionSound.SHUTTER_CLICK)
         }
         viewModelScope.launch {
-            runCatching { controller.capturePhoto() }
-                .onSuccess { controller.setLastCapture(it) }
+            try {
+                val media = controller.capturePhoto()
+                controller.setLastCapture(media)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                android.util.Log.w("MainViewModel", "Photo capture failed", e)
+                showInfo(if (s.mode == CameraMode.NIGHT) "Falha na foto noturna" else "Falha ao tirar a foto")
+            } finally {
+                photoInFlight = false
+            }
         }
     }
 
+    private var recordingToggleInFlight = false
+
     fun toggleRecording() {
+        if (recordingToggleInFlight) return
+        recordingToggleInFlight = true
         val recording = state.value.isRecording
-        if (recording) {
-            viewModelScope.launch {
-                recordingTimerJob?.cancel()
-                runCatching { controller.stopVideoRecording() }
-                    .onSuccess { controller.setLastCapture(it) }
-            }
-        } else {
-            viewModelScope.launch {
-                runCatching { controller.startVideoRecording() }
-                    .onSuccess { startRecordingTimer() }
+        viewModelScope.launch {
+            try {
+                if (recording) {
+                    recordingTimerJob?.cancel()
+                    val media = controller.stopVideoRecording()
+                    if (media != null) {
+                        controller.setLastCapture(media)
+                    } else {
+                        showInfo("Vídeo muito curto — descartado")
+                    }
+                } else {
+                    controller.startVideoRecording()
+                    if (state.value.isRecording) startRecordingTimer()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                android.util.Log.w("MainViewModel", "Recording toggle failed", e)
+                showInfo(if (recording) "Falha ao salvar o vídeo" else "Não foi possível iniciar a gravação")
+            } finally {
+                recordingToggleInFlight = false
             }
         }
     }
 
     private fun startRecordingTimer() {
+        recordingTimerJob?.cancel()
         val startedAt = System.currentTimeMillis()
+        elapsedMs = 0L
         recordingTimerJob = viewModelScope.launch {
-            while (true) {
-                delay(500)
-                // Elapsed time is derived here rather than stored in CameraController so the
-                // controller stays focused on hardware state, not UI ticking.
+            // Exits on its own once the controller reports the recording ended for any reason
+            // (user stop, backgrounding, camera recovery) - no stale timer left ticking.
+            while (state.value.isRecording) {
                 elapsedMs = System.currentTimeMillis() - startedAt
+                delay(250)
             }
         }
     }
@@ -143,12 +219,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private set
 
     fun deleteMedia(media: CapturedMedia) {
-        controller.deleteCapture(media)
-        if (reviewMedia?.uri == media.uri) reviewMedia = null
+        viewModelScope.launch { controller.deleteCapture(media) }
     }
 
     override fun onCleared() {
         super.onCleared()
+        shutterSound.release()
         controller.release()
         controller.stopBackgroundThread()
     }
