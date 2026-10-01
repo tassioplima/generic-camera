@@ -80,10 +80,36 @@ fun CameraScreen(viewModel: MainViewModel) {
         }
     }
 
+    // Long recordings (a 5-minute timelapse is only ~10s of video at 30x) must not be cut short
+    // by the system screen timeout: once the screen goes off the app is backgrounded, the
+    // camera is released and the recording stops.
+    val keepAwake = state.isRecording || state.nightCaptureProgress != null
+    KeepScreenOn(keepAwake)
+
+    // During a timelapse nothing on screen needs watching for minutes at a time, so dim the
+    // display after a while to save battery; any touch brings the brightness back.
+    var lastTouchMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    var dimmed by remember { mutableStateOf(false) }
+    val dimAllowed = state.isRecording && state.mode == CameraMode.TIMELAPSE
+    LaunchedEffect(dimAllowed, lastTouchMs) {
+        dimmed = false
+        if (!dimAllowed) return@LaunchedEffect
+        kotlinx.coroutines.delay(TIMELAPSE_DIM_AFTER_MS)
+        dimmed = true
+    }
+    ScreenBrightnessOverride(if (dimmed) 0.02f else null)
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
+            .pointerInput(Unit) {
+                // Observe every touch (without consuming it) just to reset the dim timer.
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                    lastTouchMs = System.currentTimeMillis()
+                }
+            }
             .onSizeChanged { viewSize = androidx.compose.ui.geometry.Size(it.width.toFloat(), it.height.toFloat()) },
     ) {
         CameraPreview(
@@ -360,6 +386,37 @@ fun CameraScreen(viewModel: MainViewModel) {
                 },
             )
         }
+    }
+}
+
+private const val TIMELAPSE_DIM_AFTER_MS = 15_000L
+
+/** Holds FLAG_KEEP_SCREEN_ON on this window while [enabled], and always releases it on dispose. */
+@Composable
+private fun KeepScreenOn(enabled: Boolean) {
+    val view = androidx.compose.ui.platform.LocalView.current
+    androidx.compose.runtime.DisposableEffect(view, enabled) {
+        view.keepScreenOn = enabled
+        onDispose { view.keepScreenOn = false }
+    }
+}
+
+/**
+ * Overrides this window's brightness (0..1) while [brightness] is non-null - only affects this
+ * app's window, never the system brightness setting - and restores the default on dispose.
+ */
+@Composable
+private fun ScreenBrightnessOverride(brightness: Float?) {
+    val activity = LocalContext.current as? android.app.Activity ?: return
+    androidx.compose.runtime.DisposableEffect(activity, brightness) {
+        val window = activity.window
+        fun apply(value: Float) {
+            val attrs = window.attributes
+            attrs.screenBrightness = value
+            window.attributes = attrs
+        }
+        apply(brightness ?: android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE)
+        onDispose { apply(android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE) }
     }
 }
 
