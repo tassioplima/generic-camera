@@ -119,6 +119,7 @@ class CameraController(private val appContext: Context) {
             shutterFlashEnabled = settingsStore.shutterFlashEnabled,
             nightVideoEnabled = settingsStore.nightVideoEnabled,
             timelapseSpeed = settingsStore.timelapseSpeed.takeIf { it in TIMELAPSE_SPEEDS } ?: 10,
+            audioMode = settingsStore.audioMode,
         ),
     )
     val state: StateFlow<CameraUiState> = _state.asStateFlow()
@@ -858,6 +859,12 @@ class CameraController(private val appContext: Context) {
         refreshPreviewRepeating()
     }
 
+    fun setAudioMode(mode: AudioMode) {
+        if (recorder != null) return
+        settingsStore.audioMode = mode
+        _state.update { it.copy(audioMode = mode) }
+    }
+
     fun setTimelapseSpeed(speed: Int) {
         if (recorder != null || speed !in TIMELAPSE_SPEEDS) return
         settingsStore.timelapseSpeed = speed
@@ -1277,7 +1284,11 @@ class CameraController(private val appContext: Context) {
             val mr = if (timelapse) {
                 VideoRecorder.createTimelapse(appContext, tempFile, videoOption, s.timelapseSpeed, orientation)
             } else {
-                VideoRecorder.create(appContext, tempFile, videoOption, fps, orientation)
+                VideoRecorder.create(
+                    appContext, tempFile, videoOption, fps, orientation,
+                    audioMode = s.audioMode,
+                    facingFront = prof.lensFacing == CameraCharacteristics.LENS_FACING_FRONT,
+                )
             }
             recorder = mr
             recordingFile = tempFile

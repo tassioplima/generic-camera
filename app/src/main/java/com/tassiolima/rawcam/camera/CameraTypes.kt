@@ -12,6 +12,21 @@ enum class CameraMode(val label: String) {
     val isVideo: Boolean get() = this == VIDEO || this == TIMELAPSE
 }
 
+/**
+ * Which microphone pipeline video audio comes from. Plain MIC (what this app used before)
+ * is the *voice* path - measured on the Xiaomi 17T it hard-gates pauses to digital silence,
+ * limits loud passages and has a very uneven EQ, which is the "estourado"/bad-quality sound.
+ */
+enum class AudioMode(val label: String) {
+    /** CAMCORDER: the OEM's video-tuned path - real stereo, louder, controls loud scenes, softer highs. */
+    CAMERA("Câmera"),
+    /**
+     * UNPROCESSED (or VOICE_RECOGNITION where unsupported, as on the 17T): no AGC/noise
+     * suppression - the flattest frequency response, but ~6dB quieter.
+     */
+    RAW("Sem processamento"),
+}
+
 /** Output-to-real-time speedup for timelapse: at 30x, 1 minute of filming plays back in 2s. */
 val TIMELAPSE_SPEEDS = listOf(5, 10, 30, 60, 120)
 
@@ -80,4 +95,5 @@ data class CameraUiState(
     val nightCaptureProgress: Int? = null,
     val nightVideoEnabled: Boolean = false,
     val timelapseSpeed: Int = 10,
+    val audioMode: AudioMode = AudioMode.CAMERA,
 )

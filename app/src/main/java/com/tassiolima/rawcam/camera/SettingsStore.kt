@@ -50,6 +50,10 @@ class SettingsStore(context: Context) {
         get() = prefs.getInt(KEY_TIMELAPSE_SPEED, 10)
         set(value) = prefs.edit().putInt(KEY_TIMELAPSE_SPEED, value).apply()
 
+    var audioMode: AudioMode
+        get() = AudioMode.entries.firstOrNull { it.name == prefs.getString(KEY_AUDIO_MODE, null) } ?: AudioMode.CAMERA
+        set(value) = prefs.edit().putString(KEY_AUDIO_MODE, value.name).apply()
+
     fun saveVideoSettings(width: Int, height: Int, fps: Int) {
         prefs.edit()
             .putInt(KEY_VIDEO_W, width)
@@ -69,5 +73,6 @@ class SettingsStore(context: Context) {
         const val KEY_VIDEO_FPS = "video_fps"
         const val KEY_NIGHT_VIDEO = "night_video_enabled"
         const val KEY_TIMELAPSE_SPEED = "timelapse_speed"
+        const val KEY_AUDIO_MODE = "audio_mode"
     }
 }

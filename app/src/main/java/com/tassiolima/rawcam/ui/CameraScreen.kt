@@ -353,6 +353,7 @@ fun CameraScreen(viewModel: MainViewModel) {
                 onShutterFlashToggle = { viewModel.setShutterFlashEnabled(it) },
                 onVideoSettingsChange = { size, fps -> viewModel.setVideoSettings(size, fps) },
                 onNightVideoToggle = { viewModel.setNightVideoEnabled(it) },
+                onAudioModeChange = { viewModel.setAudioMode(it) },
                 onClose = {
                     scope.launch { sheetState.hide() }
                     showSettings = false

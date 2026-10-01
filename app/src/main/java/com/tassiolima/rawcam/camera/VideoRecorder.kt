@@ -12,28 +12,86 @@ object VideoRecorder {
         return File(dir, "rawcam_${System.currentTimeMillis()}.mp4")
     }
 
+    /**
+     * Normal video. Tries stereo first and falls back to mono if this audio source can't do
+     * two channels on this phone (prepare() rejects it), rather than failing the recording.
+     */
     fun create(
         context: Context,
         outputFile: File,
         videoOption: VideoSizeOption,
         fps: Int,
         orientationHintDegrees: Int,
+        audioMode: AudioMode,
+        facingFront: Boolean,
+    ): MediaRecorder {
+        return try {
+            build(context, outputFile, videoOption, fps, orientationHintDegrees, audioMode, facingFront, channels = 2)
+        } catch (e: Exception) {
+            android.util.Log.w("VideoRecorder", "Stereo audio rejected for $audioMode, retrying mono", e)
+            outputFile.delete()
+            build(context, outputFile, videoOption, fps, orientationHintDegrees, audioMode, facingFront, channels = 1)
+        }
+    }
+
+    private fun build(
+        context: Context,
+        outputFile: File,
+        videoOption: VideoSizeOption,
+        fps: Int,
+        orientationHintDegrees: Int,
+        audioMode: AudioMode,
+        facingFront: Boolean,
+        channels: Int,
     ): MediaRecorder {
         val recorder = MediaRecorder(context)
-        recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
-        recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
-        recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-        recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-        recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-        recorder.setVideoSize(videoOption.size.width, videoOption.size.height)
-        recorder.setVideoFrameRate(fps)
-        recorder.setVideoEncodingBitRate(bitRateFor(videoOption, fps))
-        recorder.setAudioEncodingBitRate(128_000)
-        recorder.setAudioSamplingRate(44_100)
-        recorder.setOrientationHint(orientationHintDegrees)
-        recorder.setOutputFile(outputFile.absolutePath)
-        recorder.prepare()
-        return recorder
+        try {
+            recorder.setAudioSource(audioSourceFor(context, audioMode))
+            recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            recorder.setVideoSize(videoOption.size.width, videoOption.size.height)
+            recorder.setVideoFrameRate(fps)
+            recorder.setVideoEncodingBitRate(bitRateFor(videoOption, fps))
+            // 48kHz is the native rate of phone audio hardware (44.1k forces a resample), and
+            // 128kbps for stereo AAC is audibly lossy - 256kbps stereo / 160kbps mono instead.
+            recorder.setAudioChannels(channels)
+            recorder.setAudioSamplingRate(48_000)
+            recorder.setAudioEncodingBitRate(if (channels == 2) 256_000 else 160_000)
+            // Steer beamforming/mic choice toward what the camera is pointing at: the subject
+            // for the back camera, the person holding the phone for a selfie video.
+            recorder.setPreferredMicrophoneDirection(
+                if (facingFront) MediaRecorder.MIC_DIRECTION_TOWARDS_USER
+                else MediaRecorder.MIC_DIRECTION_AWAY_FROM_USER,
+            )
+            recorder.setOrientationHint(orientationHintDegrees)
+            recorder.setOutputFile(outputFile.absolutePath)
+            recorder.prepare()
+            return recorder
+        } catch (e: Exception) {
+            recorder.release()
+            throw e
+        }
+    }
+
+    /**
+     * UNPROCESSED is the truly raw mic signal, but it's optional hardware support - where it's
+     * missing, VOICE_RECOGNITION is the closest thing (Android's CDD requires it to have AGC
+     * and noise suppression off by default).
+     */
+    fun audioSourceFor(context: Context, mode: AudioMode): Int = when (mode) {
+        AudioMode.CAMERA -> MediaRecorder.AudioSource.CAMCORDER
+        AudioMode.RAW -> if (supportsUnprocessed(context)) {
+            MediaRecorder.AudioSource.UNPROCESSED
+        } else {
+            MediaRecorder.AudioSource.VOICE_RECOGNITION
+        }
+    }
+
+    fun supportsUnprocessed(context: Context): Boolean {
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+        return am.getProperty(android.media.AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
     }
 
     /**

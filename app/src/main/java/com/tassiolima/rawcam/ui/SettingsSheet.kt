@@ -6,6 +6,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
@@ -17,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.tassiolima.rawcam.camera.AudioMode
 import com.tassiolima.rawcam.camera.CameraUiState
 import com.tassiolima.rawcam.camera.PhotoAspectRatio
 import com.tassiolima.rawcam.camera.VideoSizeOption
@@ -31,9 +34,18 @@ fun SettingsSheet(
     onShutterFlashToggle: (Boolean) -> Unit,
     onVideoSettingsChange: (VideoSizeOption, Int) -> Unit,
     onNightVideoToggle: (Boolean) -> Unit,
+    onAudioModeChange: (AudioMode) -> Unit,
     onClose: () -> Unit,
 ) {
-    Column(modifier = Modifier.fillMaxWidth().padding(24.dp)) {
+    // Scrollable: with video, night video and audio options the sheet is taller than the
+    // screen, and a plain Column just clips whatever doesn't fit.
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .verticalScroll(androidx.compose.foundation.rememberScrollState())
+            .navigationBarsPadding()
+            .padding(24.dp),
+    ) {
         Text("Configurações", fontWeight = FontWeight.Bold, style = androidx.compose.material3.MaterialTheme.typography.titleLarge)
         androidx.compose.foundation.layout.Spacer(modifier = Modifier.padding(top = 16.dp))
 
@@ -127,6 +139,21 @@ fun SettingsSheet(
             }
             Switch(checked = state.nightVideoEnabled, onCheckedChange = onNightVideoToggle, enabled = !highSpeed)
         }
+
+        Text("Áudio", modifier = Modifier.padding(top = 16.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
+            AudioMode.entries.forEach { mode ->
+                Chip(label = mode.label, selected = mode == state.audioMode) { onAudioModeChange(mode) }
+            }
+        }
+        Text(
+            when (state.audioMode) {
+                AudioMode.CAMERA -> "Estéreo 48kHz ajustado pelo fabricante para vídeo: mais alto e segura sons fortes, agudos mais suaves"
+                AudioMode.RAW -> "Estéreo 48kHz sem ganho automático nem redução de ruído: resposta mais plana e fiel, porém mais baixo"
+            },
+            style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(top = 4.dp),
+        )
 
         TextButton(onClick = onClose, modifier = Modifier.padding(top = 24.dp)) {
             Text("Fechar")

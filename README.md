@@ -19,6 +19,8 @@ capability differences on other phones are expected.
   `EXTENSION_NIGHT`), with a scene-mode fallback on phones without it
 - Night video toggle (lower AE frame-rate floor + noise reduction) for video and timelapse
 - Timelapse at 5x/10x/30x/60x/120x (silent, 30fps playback)
+- Stereo 48kHz / 256kbps AAC video audio, from the video-tuned CAMCORDER source or an
+  unprocessed source (no AGC / noise suppression) - selectable in settings
 - Optical image stabilization on every stream where available; photos/videos saved upright
   when the phone is held in landscape
 - Zoom presets computed from each physical lens's real focal length + sensor size, marking

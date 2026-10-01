@@ -109,6 +109,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setTimelapseSpeed(speed: Int) = controller.setTimelapseSpeed(speed)
 
+    fun setAudioMode(mode: com.tassiolima.rawcam.camera.AudioMode) = controller.setAudioMode(mode)
+
     fun setMode(mode: CameraMode) {
         viewModelScope.launch { controller.setMode(mode) }
     }
