@@ -43,6 +43,22 @@ data class VideoSizeOption(
  */
 data class ZoomPreset(val ratio: Float, val isOptical: Boolean)
 
+/**
+ * The lens to shoot close-ups with, chosen by the smallest subject it can fill the frame with
+ * at its closest focus (sensor width x closest distance / focal length) - real optics, so an
+ * ultra-wide that focuses at 3cm only wins over a main lens that stops at 10cm when it really
+ * magnifies more.
+ */
+data class MacroLens(
+    val physicalId: String?,
+    val zoomRatio: Float,
+    /** Highest zoom that still stays on this lens (just under the next lens switch). */
+    val maxZoomRatio: Float,
+    val minFocusDiopters: Float,
+    /** Null when this lens reports uncalibrated (unitless) focus distances. */
+    val closestFocusCm: Float?,
+)
+
 /** Everything the app needs to know about a single physical camera (front or back). */
 data class CameraProfile(
     val cameraId: String,
@@ -66,6 +82,16 @@ data class CameraProfile(
     val nightExtensionSupported: Boolean,
     /** Plain CONTROL_SCENE_MODE_NIGHT - the fallback when there's no night extension. */
     val supportsNightSceneMode: Boolean,
+    /** A movable lens with CONTROL_AF_MODE_AUTO - false on fixed-focus (mostly front) cameras. */
+    val hasAutoFocus: Boolean,
+    val supportsAfMacro: Boolean,
+    /** CONTROL_AF_MODE_OFF + LENS_FOCUS_DISTANCE, for dialing the lens position by hand. */
+    val supportsManualFocus: Boolean,
+    val focusDistanceCalibrated: Boolean,
+    val minFocusDiopters: Float,
+    /** Closest focus (cm) of each calibrated physical lens, keyed by physical camera id. */
+    val lensClosestFocusCm: Map<String, Float>,
+    val macroLens: MacroLens?,
 )
 
 object CameraCapabilities {
@@ -112,7 +138,12 @@ object CameraCapabilities {
         val evStep = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)
             ?.let { it.numerator.toFloat() / it.denominator } ?: 1f
 
-        val zoomPresets = computeZoomPresets(manager, chars, zoomRange)
+        val optics = lensOptics(manager, chars, zoomRange)
+        val zoomPresets = computeZoomPresets(optics, zoomRange)
+
+        val afModes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()
+        val minFocusDiopters = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+        val hasAutoFocus = minFocusDiopters > 0f && afModes.contains(CameraCharacteristics.CONTROL_AF_MODE_AUTO)
 
         val hasFlash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) ?: false
         val flashStrengthMax = chars.get(CameraCharacteristics.FLASH_INFO_STRENGTH_MAXIMUM_LEVEL) ?: 1
@@ -145,40 +176,127 @@ object CameraCapabilities {
             supportsOis = oisModes.contains(CameraCharacteristics.LENS_OPTICAL_STABILIZATION_MODE_ON),
             nightExtensionSupported = nightExtension,
             supportsNightSceneMode = sceneModes.contains(CameraCharacteristics.CONTROL_SCENE_MODE_NIGHT),
+            hasAutoFocus = hasAutoFocus,
+            supportsAfMacro = afModes.contains(CameraCharacteristics.CONTROL_AF_MODE_MACRO),
+            supportsManualFocus = hasAutoFocus && afModes.contains(CameraCharacteristics.CONTROL_AF_MODE_OFF),
+            focusDistanceCalibrated = chars.isFocusCalibrated(),
+            minFocusDiopters = minFocusDiopters,
+            lensClosestFocusCm = optics.mapNotNull { o ->
+                val id = o.physicalId ?: return@mapNotNull null
+                o.closestFocusCm?.let { id to it }
+            }.toMap(),
+            macroLens = if (hasAutoFocus) computeMacroLens(optics, zoomRange) else null,
         )
     }
 
+    private fun CameraCharacteristics.isFocusCalibrated(): Boolean =
+        get(CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION) !=
+            CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_UNCALIBRATED
+
+    /** One physical lens (or the logical camera itself, when it exposes no physical ones). */
+    private class LensOptics(
+        val physicalId: String?,
+        val zoomRatio: Float,
+        val focalMm: Float,
+        val sensorWidthMm: Float,
+        val minFocusDiopters: Float,
+        val calibrated: Boolean,
+    ) {
+        val closestFocusCm: Float?
+            get() = if (calibrated && minFocusDiopters > 0f) 100f / minFocusDiopters else null
+
+        /** Width of the smallest subject that fills the frame, at the closest focus. */
+        val closestFieldWidthMm: Float?
+            get() = closestFocusCm?.let { cm -> sensorWidthMm * (cm * 10f) / focalMm }
+    }
+
     /**
-     * The real optical transition ratios for this camera's physical lenses, computed from
-     * each one's actual focal length + sensor physical size (field-of-view math), not just
-     * the focal-length ratio alone - two lenses with the same focal length but different
-     * sensor sizes still have different effective zoom, and vice versa. Filled out with a
-     * few standard digital-zoom stops so there's always something to tap between lenses.
+     * Each physical lens's zoom ratio, computed from its actual focal length + sensor physical
+     * size (field-of-view math), not just the focal-length ratio alone - two lenses with the
+     * same focal length but different sensor sizes still have different effective zoom.
      */
-    private fun computeZoomPresets(
+    private fun lensOptics(
         manager: CameraManager,
         chars: CameraCharacteristics,
         zoomRange: android.util.Range<Float>,
-    ): List<ZoomPreset> {
+    ): List<LensOptics> {
         fun halfFovTan(focalMm: Float, sensorWidthMm: Float): Double =
             kotlin.math.tan(kotlin.math.atan((sensorWidthMm / 2.0) / focalMm))
 
         val mainFocal = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
         val mainSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
-        val mainTanHalfFov = if (mainFocal != null && mainSize != null) halfFovTan(mainFocal, mainSize.width) else null
+        if (mainFocal == null || mainSize == null) return emptyList()
+        val mainTanHalfFov = halfFovTan(mainFocal, mainSize.width)
 
-        val opticalRatios = sortedSetOf(1f)
-        if (mainTanHalfFov != null) {
-            for (physId in chars.physicalCameraIds) {
-                val pc = runCatching { manager.getCameraCharacteristics(physId) }.getOrNull() ?: continue
-                val pFocal = pc.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: continue
-                val pSize = pc.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: continue
-                val pTanHalfFov = halfFovTan(pFocal, pSize.width)
-                if (pTanHalfFov <= 0.0) continue
-                val ratio = (mainTanHalfFov / pTanHalfFov).toFloat()
-                if (ratio in zoomRange) opticalRatios.add(ratio)
-            }
+        val lenses = mutableListOf<LensOptics>()
+        for (physId in chars.physicalCameraIds) {
+            val pc = runCatching { manager.getCameraCharacteristics(physId) }.getOrNull() ?: continue
+            val pFocal = pc.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: continue
+            val pSize = pc.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: continue
+            val pTanHalfFov = halfFovTan(pFocal, pSize.width)
+            if (pTanHalfFov <= 0.0) continue
+            val ratio = (mainTanHalfFov / pTanHalfFov).toFloat()
+            if (ratio !in zoomRange) continue
+            lenses += LensOptics(
+                physicalId = physId,
+                zoomRatio = ratio,
+                focalMm = pFocal,
+                sensorWidthMm = pSize.width,
+                minFocusDiopters = pc.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f,
+                calibrated = pc.isFocusCalibrated(),
+            )
         }
+        if (lenses.isEmpty()) {
+            lenses += LensOptics(
+                physicalId = null,
+                zoomRatio = 1f,
+                focalMm = mainFocal,
+                sensorWidthMm = mainSize.width,
+                minFocusDiopters = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f,
+                calibrated = chars.isFocusCalibrated(),
+            )
+        }
+        return lenses
+    }
+
+    /**
+     * Picks the lens that magnifies the most at its closest focus. Uncalibrated lenses report
+     * focus distance in arbitrary units, so they can't be compared - if no lens is calibrated,
+     * fall back to the main lens (still useful for macro AF + manual focus).
+     */
+    private fun computeMacroLens(optics: List<LensOptics>, zoomRange: android.util.Range<Float>): MacroLens? {
+        val autofocusing = optics.filter { it.minFocusDiopters > 0f && it.focalMm > 0f }
+        val best = autofocusing.minByOrNull { it.closestFieldWidthMm ?: Float.MAX_VALUE }
+            ?.takeIf { it.closestFieldWidthMm != null }
+            ?: autofocusing.minByOrNull { kotlin.math.abs(it.zoomRatio - 1f) }
+            ?: return null
+        val ratio = best.zoomRatio.coerceIn(zoomRange.lower, zoomRange.upper)
+        // Zooming past the next lens's switch point hands the frame to a lens that can't focus
+        // this close. Also cap digital crop at 2x: beyond that a macro is just upscaled pixels,
+        // and some HALs switch to a hidden telephoto there even when it isn't listed.
+        val nextSwitch = optics.map { it.zoomRatio }.filter { it > ratio + 0.05f }.minOrNull()
+        val maxZoom = minOf(nextSwitch?.let { it * 0.95f } ?: Float.MAX_VALUE, ratio * 2f, zoomRange.upper)
+            .coerceAtLeast(ratio)
+        return MacroLens(
+            physicalId = best.physicalId,
+            zoomRatio = ratio,
+            maxZoomRatio = maxZoom,
+            minFocusDiopters = best.minFocusDiopters,
+            closestFocusCm = best.closestFocusCm,
+        )
+    }
+
+    /**
+     * The real optical transition ratios for this camera's physical lenses (see [lensOptics]),
+     * filled out with a few standard digital-zoom stops so there's always something to tap
+     * between lenses.
+     */
+    private fun computeZoomPresets(
+        optics: List<LensOptics>,
+        zoomRange: android.util.Range<Float>,
+    ): List<ZoomPreset> {
+        val opticalRatios = sortedSetOf(1f)
+        optics.forEach { if (it.physicalId != null) opticalRatios.add(it.zoomRatio) }
 
         val digitalCandidates = listOf(0.5f, 1f, 2f, 3f, 5f, 10f).filter { it in zoomRange }
         val presets = mutableListOf<ZoomPreset>()

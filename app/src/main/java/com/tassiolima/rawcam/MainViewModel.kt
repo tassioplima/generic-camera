@@ -133,6 +133,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearFocusLock() = controller.clearFocusLock()
 
+    /** Null hands focus back to autofocus. */
+    fun setManualFocus(diopters: Float?) = controller.setManualFocus(diopters)
+
     private val shutterSound = android.media.MediaActionSound()
 
     var shutterFlash by mutableStateOf(false)
@@ -165,7 +168,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 throw e
             } catch (e: Exception) {
                 android.util.Log.w("MainViewModel", "Photo capture failed", e)
-                showInfo(if (s.mode == CameraMode.NIGHT) "Falha na foto noturna" else "Falha ao tirar a foto")
+                showInfo(
+                    when (s.mode) {
+                        CameraMode.NIGHT -> "Falha na foto noturna"
+                        CameraMode.MACRO -> "Falha na foto macro"
+                        else -> "Falha ao tirar a foto"
+                    },
+                )
             } finally {
                 photoInFlight = false
             }
