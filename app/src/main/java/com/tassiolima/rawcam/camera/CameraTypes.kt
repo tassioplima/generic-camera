@@ -5,6 +5,7 @@ import android.util.Size
 
 enum class CameraMode(val label: String) {
     NIGHT("Noite"),
+    MACRO("Macro"),
     PHOTO("Foto"),
     VIDEO("Vídeo"),
     TIMELAPSE("Timelapse");
@@ -96,4 +97,15 @@ data class CameraUiState(
     val nightVideoEnabled: Boolean = false,
     val timelapseSpeed: Int = 10,
     val audioMode: AudioMode = AudioMode.CAMERA,
+    // Macro / focus
+    val macroSupported: Boolean = false,
+    /** Closest focus of the macro lens, or null when the HAL's focus distances are uncalibrated. */
+    val macroClosestFocusCm: Float? = null,
+    /** Photo mode noticed the lens sitting at its closest limit without landing focus. */
+    val macroSuggested: Boolean = false,
+    val manualFocusSupported: Boolean = false,
+    /** Manual lens position in diopters (0 = infinity), or null while autofocus is in charge. */
+    val manualFocusDiopters: Float? = null,
+    val manualFocusMaxDiopters: Float = 0f,
+    val focusDistanceCalibrated: Boolean = false,
 )

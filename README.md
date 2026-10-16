@@ -25,8 +25,15 @@ capability differences on other phones are expected.
   when the phone is held in landscape
 - Zoom presets computed from each physical lens's real focal length + sensor size, marking
   which ratios are true optical lens switches vs. digital crop
+- Macro photo mode: picks the lens that magnifies most at its closest focus (sensor width x
+  closest focus distance / focal length, read from each physical lens), keeps zoom on that
+  lens, uses the HAL's close-range `CONTROL_AF_MODE_MACRO` scan on tap, holds a tapped focus
+  longer, and offers a manual focus slider (MF) shown in cm when the lens is calibrated
+- Photo mode suggests macro when the lens sits at its closest focus limit without locking
 - Tap-to-focus with live AF-state feedback, long-press to lock focus/exposure with a
-  drag-to-adjust exposure gesture
+  drag-to-adjust exposure gesture; the tapped region and scan mode stay on the repeating
+  request until the focus is released, and long-press locks exposure only after focus lands
+- Focus is locked (AF trigger) right before every photo, so shots aren't taken mid-hunt
 - Bottom-right capture bubble with a swipeable review gallery and one-tap share to
   WhatsApp/Telegram/Instagram
 - Settings (aspect ratio, grid, RAW, shutter sound/flash) persist across restarts

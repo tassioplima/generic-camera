@@ -8,6 +8,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,6 +26,7 @@ import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.FlashlightOn
+import androidx.compose.material.icons.filled.LocalFlorist
 import androidx.compose.material.icons.filled.NightsStay
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -217,6 +220,45 @@ fun CameraScreen(viewModel: MainViewModel) {
             )
         }
 
+        if (state.mode == CameraMode.MACRO) {
+            val closestCm = state.macroClosestFocusCm
+            val hint = when {
+                state.manualFocusDiopters != null -> "Macro • foco manual"
+                closestCm != null -> "Macro • aproxime até ~${formatCm(closestCm)} • toque para focar"
+                else -> "Macro • aproxime devagar • toque para focar"
+            }
+            Text(
+                hint,
+                color = MacroColor,
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 100.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.45f))
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+            )
+        } else if (state.mode == CameraMode.PHOTO && state.macroSuggested && !state.isRecording) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 100.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.6f))
+                    .clickable { viewModel.setMode(CameraMode.MACRO) }
+                    .padding(horizontal = 14.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(Icons.Filled.LocalFlorist, contentDescription = null, tint = MacroColor, modifier = Modifier.size(18.dp))
+                Text(
+                    "Muito perto • toque para usar o Macro",
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.padding(start = 6.dp),
+                )
+            }
+        }
+
         state.nightCaptureProgress?.let { progress ->
             Column(
                 modifier = Modifier
@@ -289,6 +331,16 @@ fun CameraScreen(viewModel: MainViewModel) {
                 )
             }
 
+            if (state.mode == CameraMode.MACRO && state.manualFocusSupported && state.manualFocusMaxDiopters > 0f) {
+                ManualFocusControl(
+                    diopters = state.manualFocusDiopters,
+                    maxDiopters = state.manualFocusMaxDiopters,
+                    calibrated = state.focusDistanceCalibrated,
+                    onChange = { viewModel.setManualFocus(it) },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(bottom = 8.dp),
+                )
+            }
+
             if (state.zoomPresets.size > 1) {
                 androidx.compose.animation.AnimatedVisibility(visible = showZoomHud) {
                     ZoomScaleHud(
@@ -312,6 +364,7 @@ fun CameraScreen(viewModel: MainViewModel) {
 
             ModeToggle(
                 mode = state.mode,
+                modes = CameraMode.entries.filter { it != CameraMode.MACRO || state.macroSupported },
                 enabled = !state.isRecording && state.nightCaptureProgress == null,
                 onModeChange = { viewModel.setMode(it) },
             )
@@ -321,7 +374,7 @@ fun CameraScreen(viewModel: MainViewModel) {
                     onClick = { viewModel.switchCamera() },
                     enabled = state.hasFrontCamera && !state.isRecording && state.ready &&
                         state.nightCaptureProgress == null,
-                    modifier = Modifier.align(Alignment.CenterStart).padding(start = 32.dp),
+                    modifier = Modifier.align(Alignment.CenterEnd).padding(end = 32.dp),
                 ) {
                     Icon(Icons.Filled.Cameraswitch, contentDescription = "Trocar câmera", tint = Color.White)
                 }
@@ -340,7 +393,7 @@ fun CameraScreen(viewModel: MainViewModel) {
                     ThumbnailBubble(
                         uri = state.lastCapture!!.uri,
                         isVideo = state.lastCapture!!.isVideo,
-                        modifier = Modifier.align(Alignment.CenterEnd).padding(end = 24.dp),
+                        modifier = Modifier.align(Alignment.CenterStart).padding(start = 24.dp),
                         enabled = !state.isRecording,
                         onClick = { viewModel.openReview(state.lastCapture!!) },
                     )
@@ -390,6 +443,66 @@ fun CameraScreen(viewModel: MainViewModel) {
 }
 
 private const val TIMELAPSE_DIM_AFTER_MS = 15_000L
+
+private val MacroColor = Color(0xFF8BC34A)
+
+private fun formatCm(cm: Float): String =
+    if (cm < 10f) "%.1f cm".format(cm).replace('.', ',') else "${cm.roundToInt()} cm"
+
+/**
+ * "AF" chip + a lens-position slider for macro. At a few centimetres autofocus often can't
+ * tell which plane you mean; dragging the lens by hand and moving the phone in and out is how
+ * close-ups are usually nailed. Left = far, right = closest the lens can go.
+ */
+@Composable
+private fun ManualFocusControl(
+    diopters: Float?,
+    maxDiopters: Float,
+    calibrated: Boolean,
+    onChange: (Float?) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
+        val manual = diopters != null
+        Text(
+            if (manual) "MF" else "AF",
+            color = if (manual) Color.Black else Color.White,
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier
+                .clip(CircleShape)
+                .background(if (manual) MacroColor else Color.White.copy(alpha = 0.2f))
+                // AF -> MF starts from the closest focus, which is where macro shots live.
+                .clickable { onChange(if (manual) null else maxDiopters) }
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+        )
+        if (manual) {
+            androidx.compose.material3.Slider(
+                value = diopters,
+                onValueChange = { onChange(it) },
+                valueRange = 0f..maxDiopters,
+                colors = androidx.compose.material3.SliderDefaults.colors(
+                    thumbColor = MacroColor,
+                    activeTrackColor = MacroColor,
+                    inactiveTrackColor = Color.White.copy(alpha = 0.3f),
+                ),
+                modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
+            )
+            val label = when {
+                !calibrated -> "${(diopters / maxDiopters * 100).roundToInt()}%"
+                diopters <= 0.01f -> "∞"
+                else -> formatCm(100f / diopters)
+            }
+            Text(label, color = Color.White, style = MaterialTheme.typography.labelMedium)
+        } else {
+            Text(
+                "Toque em AF para focar à mão",
+                color = Color.White.copy(alpha = 0.7f),
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier.padding(start = 12.dp),
+            )
+        }
+    }
+}
 
 /** Holds FLAG_KEEP_SCREEN_ON on this window while [enabled], and always releases it on dispose. */
 @Composable
@@ -688,23 +801,31 @@ private fun TimelapseSpeedRow(selected: Int, onSelect: (Int) -> Unit, modifier: 
 }
 
 @Composable
-private fun ModeToggle(mode: CameraMode, enabled: Boolean, onModeChange: (CameraMode) -> Unit) {
+private fun ModeToggle(
+    mode: CameraMode,
+    modes: List<CameraMode>,
+    enabled: Boolean,
+    onModeChange: (CameraMode) -> Unit,
+) {
+    // Five modes can overflow a narrow phone - scroll rather than clip the last one.
     Row(
         modifier = Modifier
+            .padding(horizontal = 12.dp)
+            .horizontalScroll(rememberScrollState())
             .clip(CircleShape)
             .background(Color.White.copy(alpha = 0.15f))
             .padding(4.dp),
     ) {
-        CameraMode.entries.forEach { m ->
+        modes.forEach { m ->
             val selected = mode == m
             Box(
                 modifier = Modifier
                     .clip(CircleShape)
                     .background(if (selected) Color.White else Color.Transparent)
                     .clickable(enabled = enabled) { onModeChange(m) }
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
             ) {
-                Text(m.label, color = if (selected) Color.Black else Color.White)
+                Text(m.label, color = if (selected) Color.Black else Color.White, fontSize = 14.sp)
             }
         }
     }
@@ -755,6 +876,8 @@ private fun CaptureButton(
             ) {
                 if (mode == CameraMode.NIGHT) {
                     Icon(Icons.Filled.NightsStay, contentDescription = null, tint = Color(0xFF1C1C1E))
+                } else if (mode == CameraMode.MACRO) {
+                    Icon(Icons.Filled.LocalFlorist, contentDescription = null, tint = Color(0xFF1C1C1E))
                 }
             }
         }

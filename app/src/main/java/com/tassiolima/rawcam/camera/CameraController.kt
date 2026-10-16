@@ -35,16 +35,30 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.concurrent.Executor
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 private const val TAG = "CameraController"
+// How long a tapped AF scan may take before the reticle gives up waiting on it.
+private const val FOCUS_SCAN_TIMEOUT_MS = 3000L
+// How long a tapped focus is held after it lands before going back to continuous AF. Macro
+// holds longer: at a few cm continuous AF tends to hunt, so a deliberate tap should stick.
+private const val FOCUS_HOLD_MS = 3000L
+private const val MACRO_FOCUS_HOLD_MS = 8000L
+// Max wait for the pre-shutter focus lock; past this the photo is taken anyway.
+private const val CAPTURE_AF_TIMEOUT_MS = 1000L
+private const val MACRO_CAPTURE_AF_TIMEOUT_MS = 2000L
+// ~1s of frames at the lens's closest limit before suggesting macro, ~2s clear to hide it.
+private const val TOO_CLOSE_FRAMES = 30
+private const val CLEAR_FRAMES = 60
 private const val RECONNECT_ERROR = "Não foi possível reconectar a câmera. Toque para tentar de novo."
 
 /**
@@ -93,7 +107,8 @@ class CameraController(private val appContext: Context) {
     // while it's active, since arbitrary single requests aren't supported on this session type.
     private var isHighSpeedRecording = false
 
-    private var profile: CameraProfile? = null
+    // Volatile: also read from capture callbacks on the camera thread.
+    @Volatile private var profile: CameraProfile? = null
     private var backCameraId: String? = null
     private var frontCameraId: String? = null
 
@@ -107,6 +122,21 @@ class CameraController(private val appContext: Context) {
     private var isPaused = false
 
     private var captureInProgress = false
+
+    // Last CONTROL_AF_STATE off the live stream (written on the camera thread).
+    @Volatile private var lastAfState: Int? = null
+
+    // After a tap, AF results are ignored until the frame carrying our AF_TRIGGER_START comes
+    // back - frames already in flight still describe the old continuous-AF state and would
+    // flash the reticle green before the new scan even started.
+    @Volatile private var awaitingAfTrigger = false
+
+    // "Too close for this lens" detection in photo mode - camera thread only.
+    private var tooCloseFrames = 0
+    private var clearFrames = 0
+
+    // Zoom in use before entering macro, restored on the way out.
+    private var zoomBeforeMacro: Float? = null
 
     private val settingsStore = SettingsStore(appContext)
 
@@ -337,6 +367,13 @@ class CameraController(private val appContext: Context) {
 
         val prof = CameraCapabilities.loadProfile(cameraManager, cameraId)
         profile = prof
+        lastAfState = null
+        awaitingAfTrigger = false
+        // Fixed-focus cameras (most front cameras) can't do macro.
+        if (_state.value.mode == CameraMode.MACRO && prof.macroLens == null) {
+            _state.update { it.copy(mode = CameraMode.PHOTO) }
+        }
+        zoomBeforeMacro = null
 
         val previewSize = choosePreviewSize(prof)
         normalPreviewSize = previewSize
@@ -393,8 +430,14 @@ class CameraController(private val appContext: Context) {
                 exposureCompensationStep = prof.exposureCompensationStep,
                 nightExtensionSupported = prof.nightExtensionSupported,
                 nightCaptureProgress = null,
+                macroSupported = prof.macroLens != null,
+                macroClosestFocusCm = prof.macroLens?.closestFocusCm,
+                macroSuggested = false,
+                manualFocusSupported = prof.supportsManualFocus,
+                manualFocusDiopters = null,
             )
         }
+        applyLensSettingsForMode()
 
         val device = openDevice(cameraId)
         cameraDevice = device
@@ -723,7 +766,14 @@ class CameraController(private val appContext: Context) {
         }
     }
 
-    private fun updateFocusStateFrom(result: CaptureResult) {
+    private fun updateFocusStateFrom(result: CaptureResult, request: CaptureRequest? = null) {
+        val afState = result.get(CaptureResult.CONTROL_AF_STATE)
+        lastAfState = afState
+        checkTooCloseForLens(result, afState)
+        if (awaitingAfTrigger) {
+            if (request?.get(CaptureRequest.CONTROL_AF_TRIGGER) != CaptureRequest.CONTROL_AF_TRIGGER_START) return
+            awaitingAfTrigger = false
+        }
         if (_state.value.focusIndicator == null) return
         val newState = when (result.get(CaptureResult.CONTROL_AF_STATE)) {
             CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED,
@@ -737,6 +787,50 @@ class CameraController(private val appContext: Context) {
     }
 
     /**
+     * Photo mode only: when the lens sits at its closest limit for a second without landing
+     * focus, the subject is nearer than this lens can focus - suggest macro, but only if the
+     * macro lens really focuses meaningfully closer. Hysteresis keeps the chip from flickering.
+     * Runs on the camera thread.
+     */
+    private fun checkTooCloseForLens(result: CaptureResult, afState: Int?) {
+        val s = _state.value
+        val prof = profile
+        val macro = prof?.macroLens
+        val macroCm = macro?.closestFocusCm
+        if (s.mode != CameraMode.PHOTO || prof == null || macroCm == null || s.manualFocusDiopters != null) {
+            tooCloseFrames = 0
+            clearFrames = 0
+            if (s.macroSuggested) _state.update { it.copy(macroSuggested = false) }
+            return
+        }
+        val activeId = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+        val activeCm = activeId?.let { prof.lensClosestFocusCm[it] }
+            ?: if (prof.focusDistanceCalibrated && prof.minFocusDiopters > 0f) 100f / prof.minFocusDiopters else null
+        val focusDiopters = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
+        val macroHelps = activeCm != null && macroCm < activeCm * 0.8f &&
+            (activeId == null || activeId != macro.physicalId)
+        val atClosestLimit = activeCm != null && focusDiopters != null && focusDiopters >= (100f / activeCm) * 0.97f
+        val notFocused = afState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED ||
+            afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED ||
+            afState == CaptureResult.CONTROL_AF_STATE_PASSIVE_SCAN ||
+            afState == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN
+
+        if (macroHelps && atClosestLimit && notFocused) {
+            tooCloseFrames++
+            clearFrames = 0
+        } else {
+            clearFrames++
+        }
+        val suggest = when {
+            tooCloseFrames >= TOO_CLOSE_FRAMES -> true
+            clearFrames >= CLEAR_FRAMES -> false
+            else -> s.macroSuggested
+        }
+        if (clearFrames >= CLEAR_FRAMES) tooCloseFrames = 0
+        if (suggest != s.macroSuggested) _state.update { it.copy(macroSuggested = suggest) }
+    }
+
+    /**
      * Only meaningful while a focus reticle is on screen - reads CONTROL_AF_STATE off every
      * frame so the reticle can show "searching" vs. actually landed vs. failed.
      */
@@ -746,7 +840,7 @@ class CameraController(private val appContext: Context) {
             request: CaptureRequest,
             result: TotalCaptureResult,
         ) {
-            updateFocusStateFrom(result)
+            updateFocusStateFrom(result, request)
         }
     }
 
@@ -803,22 +897,51 @@ class CameraController(private val appContext: Context) {
             }
         }
 
-        val continuousAfMode = if (activeRecorderSurface != null) {
-            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+        applyFocusParams(builder)
+    }
+
+    /** The AF mode a tap/long-press scans with - the close-range MACRO sweep in macro mode. */
+    private fun singleScanAfMode(): Int =
+        if (_state.value.mode == CameraMode.MACRO && profile?.supportsAfMacro == true) {
+            CaptureRequest.CONTROL_AF_MODE_MACRO
         } else {
-            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+            CaptureRequest.CONTROL_AF_MODE_AUTO
         }
 
+    /**
+     * The focus part of every live AND still request, so they all agree: a manual lens
+     * distance, a single-scan AF parked on the tapped region, or continuous AF.
+     *
+     * A tap used to send one AUTO + AF_TRIGGER_START frame while the repeating request stayed
+     * on continuous AF without regions - the very next frame switched the AF mode back, which
+     * resets the AF state machine and abandoned the tapped scan. Keeping the region and scan
+     * mode on the repeating request for as long as the tap is active fixes that.
+     */
+    private fun applyFocusParams(builder: CaptureRequest.Builder) {
+        val s = _state.value
         val region = lockedRegion
-        if (region != null && s.focusIndicator?.locked == true) {
-            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-            builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
-            builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
-            builder.set(CaptureRequest.CONTROL_AE_LOCK, true)
-        } else {
-            builder.set(CaptureRequest.CONTROL_AF_MODE, continuousAfMode)
-            builder.set(CaptureRequest.CONTROL_AE_LOCK, false)
+        val manual = s.manualFocusDiopters
+        if (profile?.hasAutoFocus == true) {
+            when {
+                manual != null -> {
+                    builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                    builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, manual)
+                }
+                region != null -> {
+                    builder.set(CaptureRequest.CONTROL_AF_MODE, singleScanAfMode())
+                    builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
+                }
+                activeRecorderSurface != null ->
+                    builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                else ->
+                    builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            }
         }
+        region?.let { builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(it)) }
+        // A long-press locks exposure only once focus has landed, so AE first meters on the
+        // pressed point instead of freezing whatever exposure the old framing had.
+        val lockAe = region != null && s.focusIndicator?.locked == true && s.focusState != FocusState.SEARCHING
+        builder.set(CaptureRequest.CONTROL_AE_LOCK, lockAe)
     }
 
     private fun refreshPreviewRepeating() {
@@ -871,11 +994,77 @@ class CameraController(private val appContext: Context) {
         _state.update { it.copy(timelapseSpeed = speed) }
     }
 
+    fun setManualFocus(diopters: Float?) {
+        val s = _state.value
+        if (!s.manualFocusSupported || extensionSession != null || isHighSpeedRecording || captureInProgress) return
+        if (diopters != null) {
+            cancelFocusRevert()
+            lockedRegion = null
+            awaitingAfTrigger = false
+        }
+        _state.update {
+            it.copy(
+                manualFocusDiopters = diopters?.coerceIn(0f, it.manualFocusMaxDiopters),
+                focusIndicator = if (diopters != null) null else it.focusIndicator,
+            )
+        }
+        refreshPreviewRepeating()
+    }
+
+    /**
+     * Zoom range/presets and manual-focus range for the current mode. Macro pins the zoom to
+     * the macro lens: past the next lens switch the HAL hands the frame to a lens that can't
+     * focus that close.
+     */
+    private fun applyLensSettingsForMode() {
+        val prof = profile ?: return
+        val macro = prof.macroLens
+        if (_state.value.mode == CameraMode.MACRO && macro != null) {
+            val presets = buildList {
+                add(ZoomPreset(macro.zoomRatio, isOptical = true))
+                listOf(1.5f, 2f).map { macro.zoomRatio * it }
+                    .filter { it <= macro.maxZoomRatio + 0.01f }
+                    .forEach { add(ZoomPreset(it, isOptical = false)) }
+            }
+            _state.update {
+                it.copy(
+                    minZoomRatio = macro.zoomRatio,
+                    maxZoomRatio = macro.maxZoomRatio,
+                    zoomPresets = presets,
+                    zoomRatio = macro.zoomRatio,
+                    manualFocusMaxDiopters = macro.minFocusDiopters,
+                    focusDistanceCalibrated = macro.closestFocusCm != null,
+                )
+            }
+        } else {
+            val range = prof.zoomRatioRange
+            _state.update {
+                it.copy(
+                    minZoomRatio = range.lower,
+                    maxZoomRatio = range.upper,
+                    zoomPresets = prof.zoomPresets,
+                    zoomRatio = it.zoomRatio.coerceIn(range.lower, range.upper),
+                    manualFocusMaxDiopters = prof.minFocusDiopters,
+                    focusDistanceCalibrated = prof.focusDistanceCalibrated,
+                )
+            }
+        }
+    }
+
     suspend fun setMode(mode: CameraMode) {
         if (recorder != null || captureInProgress) return
-        if (_state.value.mode == mode) return
+        val previous = _state.value.mode
+        if (previous == mode) return
+        if (mode == CameraMode.MACRO && profile?.macroLens == null) return
         clearFocusLockSilently()
-        _state.update { it.copy(mode = mode) }
+        if (mode == CameraMode.MACRO) zoomBeforeMacro = _state.value.zoomRatio
+        _state.update { it.copy(mode = mode, manualFocusDiopters = null, macroSuggested = false) }
+        applyLensSettingsForMode()
+        if (previous == CameraMode.MACRO) {
+            val restore = zoomBeforeMacro ?: 1f
+            zoomBeforeMacro = null
+            _state.update { it.copy(zoomRatio = restore.coerceIn(it.minZoomRatio, it.maxZoomRatio)) }
+        }
         reconfigureForModeIfNeeded()
         // Night-video params depend on the mode too (e.g. Foto -> Vídeo with night video on).
         refreshPreviewRepeating()
@@ -976,19 +1165,32 @@ class CameraController(private val appContext: Context) {
         )
     }
 
-    /** Quick tap: focuses at the point, then reverts to continuous AF/AE shortly after. */
+    /** Quick tap: focuses at the point, holds there for a moment, then reverts to continuous AF/AE. */
     fun focusTap(xInView: Float, yInView: Float) {
+        startRegionFocus(xInView, yInView, lock = false)
+    }
+
+    /** Long-press: focuses and locks exposure at the point until the user taps elsewhere. */
+    fun focusLongPressLock(xInView: Float, yInView: Float) {
+        startRegionFocus(xInView, yInView, lock = true)
+    }
+
+    private fun startRegionFocus(xInView: Float, yInView: Float, lock: Boolean) {
         if (isHighSpeedRecording || captureInProgress) return
         val device = cameraDevice ?: return
         val region = meteringRectForCurrentPreview(xInView, yInView) ?: return
 
         cancelFocusRevert()
         lockedRegion = region
+        val hasAf = profile?.hasAutoFocus == true
         _state.update {
             it.copy(
-                focusIndicator = FocusIndicator(xInView, yInView, locked = false),
-                focusState = FocusState.SEARCHING,
+                focusIndicator = FocusIndicator(xInView, yInView, locked = lock),
+                // Fixed-focus lens: nothing to scan, the tap only meters exposure.
+                focusState = if (hasAf) FocusState.SEARCHING else FocusState.FOCUSED,
                 exposureCompensation = 0,
+                // Tapping is how you hand focus back to AF after dialing it by hand.
+                manualFocusDiopters = null,
             )
         }
 
@@ -997,53 +1199,51 @@ class CameraController(private val appContext: Context) {
             startNightRepeating(night)
         } else {
             val session = stillSession ?: return
-            safeSessionOp("focusTap capture") {
-                val builder = buildLiveRequestBuilder(device) ?: return@safeSessionOp
-                builder.set(CaptureRequest.CONTROL_AE_LOCK, false)
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-                builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region))
-                builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(region))
-                builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
-                session.capture(builder.build(), afStateCallback, backgroundHandler)
-            }
+            triggerRegionFocus(session, device, hasAf)
         }
 
         focusRevertJob = controllerScope.launch {
-            delay(2500)
+            awaitFocusSettled(FOCUS_SCAN_TIMEOUT_MS)
+            if (lock) {
+                // Now that focus has landed, re-issue the request so AE locks on this point.
+                refreshPreviewRepeating()
+                return@launch
+            }
+            delay(if (_state.value.mode == CameraMode.MACRO) MACRO_FOCUS_HOLD_MS else FOCUS_HOLD_MS)
+            awaitingAfTrigger = false
             lockedRegion = null
             _state.update { it.copy(focusIndicator = null) }
             refreshPreviewRepeating()
         }
     }
 
-    /** Long-press: focuses and locks exposure at the point until the user taps elsewhere. */
-    fun focusLongPressLock(xInView: Float, yInView: Float) {
-        if (isHighSpeedRecording || captureInProgress) return
-        val device = cameraDevice ?: return
-        val region = meteringRectForCurrentPreview(xInView, yInView) ?: return
-
-        cancelFocusRevert()
-        lockedRegion = region
-        _state.update {
-            it.copy(
-                focusIndicator = FocusIndicator(xInView, yInView, locked = true),
-                focusState = FocusState.SEARCHING,
-                exposureCompensation = 0,
-            )
-        }
-
-        val night = extensionSession
-        if (night != null) {
-            startNightRepeating(night)
-            return
-        }
-        val session = stillSession ?: return
-        safeSessionOp("focusLongPressLock") {
+    /**
+     * Starts a fresh single-scan AF on [lockedRegion]: the repeating request switches to the
+     * scan mode + region first (see [applyFocusParams]), then CANCEL clears any previous lock
+     * and START begins the new sweep.
+     */
+    private fun triggerRegionFocus(session: CameraCaptureSession, device: CameraDevice, hasAf: Boolean) {
+        safeSessionOp("region focus") {
             val builder = buildLiveRequestBuilder(device) ?: return@safeSessionOp
-            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
-            session.capture(builder.build(), afStateCallback, backgroundHandler)
-            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
             session.setRepeatingRequest(builder.build(), afStateCallback, backgroundHandler)
+            if (!hasAf) return@safeSessionOp
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
+            session.capture(builder.build(), afStateCallback, backgroundHandler)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+            awaitingAfTrigger = true
+            try {
+                session.capture(builder.build(), afStateCallback, backgroundHandler)
+            } catch (e: Exception) {
+                awaitingAfTrigger = false
+                throw e
+            }
+        }
+    }
+
+    /** Suspends until the reticle's AF scan has landed or failed (or [timeoutMs] passes). */
+    private suspend fun awaitFocusSettled(timeoutMs: Long) {
+        withTimeoutOrNull(timeoutMs) {
+            _state.first { it.focusIndicator == null || it.focusState != FocusState.SEARCHING }
         }
     }
 
@@ -1067,6 +1267,7 @@ class CameraController(private val appContext: Context) {
     private fun clearFocusLockSilently() {
         cancelFocusRevert()
         lockedRegion = null
+        awaitingAfTrigger = false
         _state.update { it.copy(focusIndicator = null, exposureCompensation = 0) }
     }
 
@@ -1081,6 +1282,7 @@ class CameraController(private val appContext: Context) {
             extensionSession?.let { return performNightCapture(it, device, prof) }
 
             val session = stillSession ?: error("Camera not ready")
+            val lockedContinuousAf = lockFocusForCapture(session, device, prof)
             // A real camera flash needs a metering pre-flash to figure out the right power for
             // the actual shot - skipping straight to a full-power strobe blows highlights out.
             val flash = _state.value.flashMode
@@ -1091,10 +1293,85 @@ class CameraController(private val appContext: Context) {
             return try {
                 performStillCapture(session, device, prof)
             } finally {
-                if (usedPrecapture) refreshPreviewRepeating()
+                if (lockedContinuousAf) releaseCaptureFocusLock(session, device)
+                if (usedPrecapture || lockedContinuousAf) refreshPreviewRepeating()
             }
         } finally {
             captureInProgress = false
+        }
+    }
+
+    /**
+     * Locks focus right before the shutter, so a photo is never taken while continuous AF is
+     * still moving the lens - the classic blurry close-up. In CONTINUOUS_PICTURE an
+     * AF_TRIGGER_START locks within a frame when the scene is already sharp, and finishes the
+     * scan first when it isn't. Returns true when it locked continuous AF, which must then be
+     * released with [releaseCaptureFocusLock].
+     */
+    private suspend fun lockFocusForCapture(
+        session: CameraCaptureSession,
+        device: CameraDevice,
+        prof: CameraProfile,
+    ): Boolean {
+        val s = _state.value
+        if (!prof.hasAutoFocus || s.manualFocusDiopters != null || isHighSpeedRecording) return false
+        val timeout = if (s.mode == CameraMode.MACRO) MACRO_CAPTURE_AF_TIMEOUT_MS else CAPTURE_AF_TIMEOUT_MS
+        if (lockedRegion != null) {
+            // A tap already runs its own scan on that region - just let it finish.
+            awaitFocusSettled(timeout)
+            return false
+        }
+
+        val locked = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val callback = object : CameraCaptureSession.CaptureCallback() {
+            var triggerSeen = false
+            override fun onCaptureCompleted(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                result: TotalCaptureResult,
+            ) {
+                if (request.get(CaptureRequest.CONTROL_AF_TRIGGER) == CaptureRequest.CONTROL_AF_TRIGGER_START) {
+                    triggerSeen = true
+                }
+                if (!triggerSeen) return
+                when (result.get(CaptureResult.CONTROL_AF_STATE)) {
+                    CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED,
+                    CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED,
+                    null,
+                    -> locked.complete(Unit)
+                }
+            }
+
+            override fun onCaptureFailed(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                failure: android.hardware.camera2.CaptureFailure,
+            ) {
+                if (request.get(CaptureRequest.CONTROL_AF_TRIGGER) == CaptureRequest.CONTROL_AF_TRIGGER_START) {
+                    locked.complete(Unit)
+                }
+            }
+        }
+
+        var triggered = false
+        safeSessionOp("capture focus lock") {
+            val builder = buildLiveRequestBuilder(device) ?: return@safeSessionOp
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+            session.capture(builder.build(), callback, backgroundHandler)
+            triggered = true
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+            session.setRepeatingRequest(builder.build(), callback, backgroundHandler)
+        }
+        if (triggered) withTimeoutOrNull(timeout) { locked.await() }
+        return triggered
+    }
+
+    /** Unlocks continuous AF after the shot, so the preview resumes tracking the scene. */
+    private fun releaseCaptureFocusLock(session: CameraCaptureSession, device: CameraDevice) {
+        safeSessionOp("release focus lock") {
+            val builder = buildLiveRequestBuilder(device) ?: return@safeSessionOp
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
+            session.capture(builder.build(), afStateCallback, backgroundHandler)
         }
     }
 
@@ -1152,7 +1429,12 @@ class CameraController(private val appContext: Context) {
         val nightFallback = s.mode == CameraMode.NIGHT
         // RAW in the night fallback would just be a single dark frame - skip it there.
         val raw = if (s.rawEnabled && !nightFallback) rawReader else null
-        val displayName = (if (nightFallback) "NIGHT_" else "RAW_") + System.currentTimeMillis()
+        val prefix = when {
+            nightFallback -> "NIGHT_"
+            s.mode == CameraMode.MACRO -> "MACRO_"
+            else -> "RAW_"
+        }
+        val displayName = prefix + System.currentTimeMillis()
 
         // Everything below is only touched from backgroundHandler callbacks.
         var jpegUri: android.net.Uri? = null
@@ -1223,7 +1505,7 @@ class CameraController(private val appContext: Context) {
                 flashMode = if (nightFallback) FlashMode.OFF else s.flashMode,
                 zoomRatio = s.zoomRatio,
                 exposureCompensation = s.exposureCompensation,
-                afRegions = lockedRegion?.let { arrayOf(it) },
+                applyFocus = ::applyFocusParams,
                 ois = prof.supportsOis,
                 nightSceneFallback = nightFallback && prof.supportsNightSceneMode,
             )

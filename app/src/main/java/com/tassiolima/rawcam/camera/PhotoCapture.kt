@@ -29,7 +29,7 @@ object PhotoCapture {
         flashMode: FlashMode,
         zoomRatio: Float,
         exposureCompensation: Int = 0,
-        afRegions: Array<android.hardware.camera2.params.MeteringRectangle>?,
+        applyFocus: (CaptureRequest.Builder) -> Unit,
         ois: Boolean = false,
         nightSceneFallback: Boolean = false,
     ): CaptureRequest {
@@ -62,11 +62,10 @@ object PhotoCapture {
         builder.set(CaptureRequest.JPEG_QUALITY, 100.toByte())
         builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoomRatio)
         builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, exposureCompensation)
-        afRegions?.let {
-            builder.set(CaptureRequest.CONTROL_AF_REGIONS, it)
-            builder.set(CaptureRequest.CONTROL_AE_REGIONS, it)
-            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-        }
+        // Same AF mode/regions (or manual lens distance) as the live stream: switching AF mode
+        // on the still request resets the AF state machine and can let the lens drift off the
+        // focus that was just locked for this shot.
+        applyFocus(builder)
         return builder.build()
     }
 
