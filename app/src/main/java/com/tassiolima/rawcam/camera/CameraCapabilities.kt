@@ -208,6 +208,10 @@ object CameraCapabilities {
         /** Width of the smallest subject that fills the frame, at the closest focus. */
         val closestFieldWidthMm: Float?
             get() = closestFocusCm?.let { cm -> sensorWidthMm * (cm * 10f) / focalMm }
+
+        /** Same, but reading the focus distance as diopters even when the lens is uncalibrated. */
+        val estimatedFieldWidthMm: Float
+            get() = sensorWidthMm * (1000f / minFocusDiopters) / focalMm
     }
 
     /**
@@ -260,14 +264,21 @@ object CameraCapabilities {
     }
 
     /**
-     * Picks the lens that magnifies the most at its closest focus. Uncalibrated lenses report
-     * focus distance in arbitrary units, so they can't be compared - if no lens is calibrated,
-     * fall back to the main lens (still useful for macro AF + manual focus).
+     * Picks the lens that magnifies the most at its closest focus.
+     *
+     * Officially, uncalibrated lenses report focus distance in arbitrary units. In practice
+     * many HALs (the Xiaomi 17T marks every lens UNCALIBRATED, yet reports 10 D for the main
+     * lens and 3.33 D for the 5x tele - i.e. 10cm and 30cm) still report real diopters. So when
+     * no lens is calibrated, the values are trusted for ranking only if every autofocus lens
+     * reports a plausible diopter (2m..2cm); otherwise fall back to the main lens, which is
+     * still useful for macro AF + manual focus. The cm hint stays hidden either way.
      */
     private fun computeMacroLens(optics: List<LensOptics>, zoomRange: android.util.Range<Float>): MacroLens? {
         val autofocusing = optics.filter { it.minFocusDiopters > 0f && it.focalMm > 0f }
-        val best = autofocusing.minByOrNull { it.closestFieldWidthMm ?: Float.MAX_VALUE }
-            ?.takeIf { it.closestFieldWidthMm != null }
+        val calibrated = autofocusing.filter { it.closestFieldWidthMm != null }
+        val plausible = autofocusing.size > 1 && autofocusing.all { it.minFocusDiopters in 0.5f..50f }
+        val best = calibrated.minByOrNull { it.closestFieldWidthMm!! }
+            ?: autofocusing.takeIf { plausible }?.minByOrNull { it.estimatedFieldWidthMm }
             ?: autofocusing.minByOrNull { kotlin.math.abs(it.zoomRatio - 1f) }
             ?: return null
         val ratio = best.zoomRatio.coerceIn(zoomRange.lower, zoomRange.upper)

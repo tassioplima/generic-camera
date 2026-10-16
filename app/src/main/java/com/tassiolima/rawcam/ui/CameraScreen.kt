@@ -374,7 +374,7 @@ fun CameraScreen(viewModel: MainViewModel) {
                     onClick = { viewModel.switchCamera() },
                     enabled = state.hasFrontCamera && !state.isRecording && state.ready &&
                         state.nightCaptureProgress == null,
-                    modifier = Modifier.align(Alignment.CenterStart).padding(start = 32.dp),
+                    modifier = Modifier.align(Alignment.CenterEnd).padding(end = 32.dp),
                 ) {
                     Icon(Icons.Filled.Cameraswitch, contentDescription = "Trocar câmera", tint = Color.White)
                 }
@@ -393,7 +393,7 @@ fun CameraScreen(viewModel: MainViewModel) {
                     ThumbnailBubble(
                         uri = state.lastCapture!!.uri,
                         isVideo = state.lastCapture!!.isVideo,
-                        modifier = Modifier.align(Alignment.CenterEnd).padding(end = 24.dp),
+                        modifier = Modifier.align(Alignment.CenterStart).padding(start = 24.dp),
                         enabled = !state.isRecording,
                         onClick = { viewModel.openReview(state.lastCapture!!) },
                     )
@@ -823,9 +823,9 @@ private fun ModeToggle(
                     .clip(CircleShape)
                     .background(if (selected) Color.White else Color.Transparent)
                     .clickable(enabled = enabled) { onModeChange(m) }
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
             ) {
-                Text(m.label, color = if (selected) Color.Black else Color.White)
+                Text(m.label, color = if (selected) Color.Black else Color.White, fontSize = 14.sp)
             }
         }
     }
